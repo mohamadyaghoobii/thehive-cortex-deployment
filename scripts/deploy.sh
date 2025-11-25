@@ -1,11 +1,11 @@
 #!/bin/bash
 # TheHive & Cortex Ultimate Deployment Script
-# Version: 2.5 - Full Reset, Single-Node
+# Version: 3.0 - Full Reset, Single-Node, Native or Docker
 #
 # WARNING: THIS SCRIPT IS DESTRUCTIVE ON THIS HOST
 # -----------------------------------------------
-# It will:
-#   - Stop TheHive, Cortex, Elasticsearch, Cassandra
+# It will (in both modes):
+#   - Stop TheHive, Cortex, Elasticsearch, Cassandra (if present)
 #   - Kill any process listening on ports: 9000, 9001, 9200, 9042
 #   - Remove config, data and log directories for:
 #       * TheHive
@@ -16,12 +16,25 @@
 # Use this only on a dedicated lab/PoC/single-node box where these services
 # are not shared with other applications.
 #
-# It then installs and configures:
-#   - TheHive 5.2.16
-#   - Cortex 3.1.8
-#   - Elasticsearch 7.17.29  (will be installed if missing)
-#   - Cassandra 3.11/4.x     (will be installed if missing)
-#   - systemd units, health check and integration helper scripts
+# DEPLOYMENT MODES
+# ----------------
+#   1) native:
+#       - Installs and configures:
+#           * TheHive 5.2.16
+#           * Cortex 3.1.8
+#           * Elasticsearch 7.17.29
+#           * Cassandra 3.11/4.x
+#       - Creates systemd units, health check and integration helper scripts.
+#
+#   2) docker:
+#       - Installs Docker + docker-compose-plugin (if missing)
+#       - Deploys a single-node stack via docker-compose:
+#           * TheHive 5.2.x (container)
+#           * Cortex 3.1.8 (container)
+#           * Elasticsearch 7.17.29 (container)
+#           * Cassandra 3.11 (container)
+#
+# In both cases you end up with TheHive on port 9000 and Cortex on port 9001.
 
 set -euo pipefail
 
@@ -53,6 +66,9 @@ CASSANDRA_PASS="${CASSANDRA_PASS:-cassandra}"
 # Script directory (used to look for local .deb packages)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Deployment mode: native (packages) or docker (containers)
+DEPLOY_MODE="native"
+
 # ---------------------------------------------------------------------------
 # BANNER
 # ---------------------------------------------------------------------------
@@ -62,20 +78,42 @@ print_banner() {
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║                                                                ║"
     echo "║           THEHIVE & CORTEX ENTERPRISE DEPLOYMENT              ║"
-    echo "║                     Version 2.5 - Full Reset                  ║"
+    echo "║              Version 3.0 - Full Reset (Native/Docker)         ║"
     echo "║                                                                ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo "This script will deploy:"
-    echo "  • TheHive 5.2.16 - Incident Response Platform"
-    echo "  • Cortex 3.1.8   - Analysis Engine"
-    echo "  • Elasticsearch 7.17.29 - Search & Analytics"
-    echo "  • Cassandra      - Scalable Database"
-    echo "  • Java 11        - Runtime Environment"
+    echo "This script can deploy on this host:"
+    echo "  • TheHive 5.2.16  (native) or 5.2.x (docker image)"
+    echo "  • Cortex 3.1.8"
+    echo "  • Elasticsearch 7.17.29"
+    echo "  • Cassandra 3.11/4.x"
+    echo "  • Java 11 (native mode)"
     echo ""
     echo "!!! WARNING: All existing TheHive/Cortex/ES/Cassandra data on this host"
     echo "!!! will be wiped before installation (full reset)."
     echo ""
+}
+
+# ---------------------------------------------------------------------------
+# DEPLOYMENT MODE SELECTION
+# ---------------------------------------------------------------------------
+select_deploy_mode() {
+    echo
+    log_step "Choose deployment mode for TheHive/Cortex on THIS host"
+    echo "  1) Native  (OS packages: Elasticsearch, Cassandra, TheHive, Cortex)"
+    echo "  2) Docker  (all services as containers via docker compose)"
+    read -rp "Enter choice [1/2] (default: 1): " choice
+
+    case "$choice" in
+        2)
+            DEPLOY_MODE="docker"
+            ;;
+        *)
+            DEPLOY_MODE="native"
+            ;;
+    esac
+
+    log_info "Selected deployment mode: ${DEPLOY_MODE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -217,7 +255,7 @@ pre_cleanup() {
 }
 
 # ---------------------------------------------------------------------------
-# PREPARE BASE DIRECTORIES + PLACEHOLDER CONFIGS
+# PREPARE BASE DIRECTORIES + PLACEHOLDER CONFIGS (NATIVE MODE)
 # ---------------------------------------------------------------------------
 prepare_base_dirs() {
     log_step "Preparing base directories and placeholder config files..."
@@ -230,7 +268,7 @@ prepare_base_dirs() {
     # Minimal placeholder config files for TheHive so postinst 'chown' will not fail
     if [[ ! -f /etc/thehive/application.conf ]]; then
         cat > /etc/thehive/application.conf << 'EOF'
-# Temporary placeholder TheHive configuration - overwritten by deploy.sh
+# Temporary placeholder TheHive configuration - overwritten by deploy script
 play.http.secret.key="temporary_placeholder_secret"
 EOF
     fi
@@ -255,7 +293,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# DEPENDENCIES
+# DEPENDENCIES (BOTH MODES)
 # ---------------------------------------------------------------------------
 install_dependencies() {
     log_step "Installing system dependencies..."
@@ -285,7 +323,7 @@ install_dependencies() {
 }
 
 # ---------------------------------------------------------------------------
-# INSTALL ELASTICSEARCH IF MISSING (7.17.29)
+# ELASTICSEARCH INSTALL (NATIVE MODE)
 # ---------------------------------------------------------------------------
 install_elasticsearch_if_missing() {
     if dpkg -s elasticsearch >/dev/null 2>&1; then
@@ -357,7 +395,7 @@ install_elasticsearch_if_missing() {
 }
 
 # ---------------------------------------------------------------------------
-# INSTALL CASSANDRA IF MISSING
+# CASSANDRA INSTALL (NATIVE MODE)
 # ---------------------------------------------------------------------------
 install_cassandra_if_missing() {
     if dpkg -s cassandra >/dev/null 2>&1; then
@@ -384,7 +422,7 @@ install_cassandra_if_missing() {
 }
 
 # ---------------------------------------------------------------------------
-# ELASTICSEARCH SETUP
+# ELASTICSEARCH SETUP (NATIVE MODE)
 # ---------------------------------------------------------------------------
 setup_elasticsearch() {
     log_step "Configuring Elasticsearch 7.17.29..."
@@ -459,7 +497,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# CASSANDRA SETUP (WITH HARD RESET TO AVOID CLUSTER_NAME MISMATCH)
+# CASSANDRA SETUP (NATIVE MODE)
 # ---------------------------------------------------------------------------
 setup_cassandra() {
     log_step "Configuring Cassandra database..."
@@ -593,7 +631,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# THEHIVE INSTALL
+# THEHIVE INSTALL (NATIVE MODE)
 # ---------------------------------------------------------------------------
 install_thehive() {
     log_step "Installing TheHive 5.2.16..."
@@ -626,7 +664,7 @@ install_thehive() {
 }
 
 # ---------------------------------------------------------------------------
-# CORTEX INSTALL
+# CORTEX INSTALL (NATIVE MODE)
 # ---------------------------------------------------------------------------
 install_cortex() {
     log_step "Installing Cortex 3.1.8..."
@@ -663,7 +701,7 @@ install_cortex() {
 }
 
 # ---------------------------------------------------------------------------
-# CORTEX ANALYZERS REPO
+# CORTEX ANALYZERS REPO (NATIVE MODE)
 # ---------------------------------------------------------------------------
 install_cortex_analyzers_repo() {
     log_step "Preparing Cortex-Analyzers repository under /opt..."
@@ -689,7 +727,7 @@ install_cortex_analyzers_repo() {
 }
 
 # ---------------------------------------------------------------------------
-# THEHIVE CONFIG
+# THEHIVE CONFIG (NATIVE MODE)
 # ---------------------------------------------------------------------------
 configure_thehive() {
     log_step "Configuring TheHive application..."
@@ -819,7 +857,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# CORTEX CONFIG
+# CORTEX CONFIG (NATIVE MODE)
 # ---------------------------------------------------------------------------
 configure_cortex() {
     log_step "Configuring Cortex application..."
@@ -974,7 +1012,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# SYSTEMD SERVICES
+# SYSTEMD SERVICES (NATIVE MODE)
 # ---------------------------------------------------------------------------
 setup_systemd_services() {
     log_step "Configuring systemd services for TheHive and Cortex..."
@@ -1073,7 +1111,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# START & HEALTH CHECK
+# SERVICE START & HEALTH (NATIVE MODE)
 # ---------------------------------------------------------------------------
 start_services() {
     log_step "Starting all services..."
@@ -1144,7 +1182,133 @@ wait_for_services() {
 }
 
 # ---------------------------------------------------------------------------
-# INTEGRATION SCRIPT
+# DOCKER-BASED STACK (TheHive + Cortex + ES + Cassandra)
+# ---------------------------------------------------------------------------
+install_docker_stack() {
+    log_step "Installing Docker engine and deploying TheHive/Cortex stack (Docker mode)..."
+
+    # Install Docker if missing
+    if ! command -v docker >/dev/null 2>&1; then
+        log_info "Docker not found, installing docker.io and docker-compose-plugin..."
+        apt-get update || log_warn "apt-get update failed, continuing anyway..."
+        apt-get install -y docker.io docker-compose-plugin
+        systemctl enable docker || true
+        systemctl start docker || true
+    else
+        log_info "Docker already installed."
+    fi
+
+    # Tune vm.max_map_count for Elasticsearch inside container
+    if ! sysctl vm.max_map_count >/dev/null 2>&1 || \
+       [ "$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)" -lt 262144 ]; then
+        log_info "Setting vm.max_map_count=262144 for Elasticsearch (Docker)..."
+        sysctl -w vm.max_map_count=262144 >/dev/null 2>&1 || true
+        if ! grep -q "vm.max_map_count" /etc/sysctl.conf 2>/dev/null; then
+            echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+        fi
+    fi
+
+    local STACK_DIR="/opt/thehive-docker"
+    mkdir -p "${STACK_DIR}"
+    cd "${STACK_DIR}"
+
+    log_info "Writing docker-compose.yml to ${STACK_DIR}"
+
+    cat > docker-compose.yml << 'EOF'
+version: "3.8"
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+  cassandra:
+    image: cassandra:3.11
+    environment:
+      - MAX_HEAP_SIZE=1024M
+      - HEAP_NEWSIZE=256M
+      - CASSANDRA_CLUSTER_NAME=TheHive Cluster
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassdata:/var/lib/cassandra
+
+  cortex:
+    image: thehiveproject/cortex:3.1.8
+    depends_on:
+      - elasticsearch
+    environment:
+      - job_directory=/tmp/cortex-jobs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cortex-jobs:/tmp/cortex-jobs
+      - cortex-logs:/var/log/cortex
+    ports:
+      - "9001:9001"
+
+  thehive:
+    image: strangebee/thehive:5.2.16
+    depends_on:
+      - elasticsearch
+      - cassandra
+      - cortex
+    environment:
+      - JAVA_OPTS=-Xms1g -Xmx2g
+      - CLUSTER_NAME=TheHive Cluster
+      - CQL_HOSTS=cassandra
+      - CQL_KEYSPACE=thehive
+      - ES_HOSTS=http://elasticsearch:9200
+      - CORTEX_SERVERS_0_NAME=local-cortex
+      - CORTEX_SERVERS_0_URL=http://cortex:9001
+    ports:
+      - "9000:9000"
+    volumes:
+      - thehive-data:/opt/thp/thehive
+
+volumes:
+  esdata:
+  cassdata:
+  cortex-jobs:
+  cortex-logs:
+  thehive-data:
+EOF
+
+    log_info "Pulling Docker images..."
+    docker compose pull || log_warn "docker compose pull failed, continuing..."
+
+    log_info "Starting Docker stack..."
+    docker compose up -d
+
+    log_info "Waiting for TheHive (Docker) to respond on http://127.0.0.1:9000/api/status ..."
+    local tries=0
+    while ! curl -s http://127.0.0.1:9000/api/status >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if [[ $tries -gt 60 ]]; then
+            log_warn "TheHive in Docker did not become ready within timeout."
+            log_warn "Check logs with: cd ${STACK_DIR} && docker compose logs thehive"
+            break
+        fi
+        sleep 5
+    done
+
+    log_ok "Docker-based TheHive/Cortex stack started."
+    log_info "Check status with:"
+    log_info "  cd ${STACK_DIR} && docker compose ps"
+}
+
+# ---------------------------------------------------------------------------
+# INTEGRATION SCRIPT (NATIVE MODE)
 # ---------------------------------------------------------------------------
 create_integration_script() {
     log_step "Creating Cortex-TheHive integration helper script..."
@@ -1272,7 +1436,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# HEALTH CHECK SCRIPT
+# HEALTH CHECK SCRIPT (NATIVE MODE)
 # ---------------------------------------------------------------------------
 create_health_check() {
     log_step "Creating health check helper script..."
@@ -1319,13 +1483,13 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# FINAL SUMMARY
+# FINAL SUMMARY (NATIVE MODE)
 # ---------------------------------------------------------------------------
 finalize_installation() {
-    log_step "Writing installation summary..."
+    log_step "Writing installation summary (native mode)..."
 
     cat > /root/thehive-installation-summary.txt << EOF
-=== THEHIVE & CORTEX INSTALLATION SUMMARY ===
+=== THEHIVE & CORTEX INSTALLATION SUMMARY (NATIVE MODE) ===
 
 Installation Date: $(date)
 TheHive Version: 5.2.16
@@ -1389,6 +1553,40 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# FINAL SUMMARY (DOCKER MODE)
+# ---------------------------------------------------------------------------
+finalize_installation_docker() {
+    log_step "Writing installation summary (Docker mode)..."
+
+    cat > /root/thehive-installation-summary.txt << EOF
+=== THEHIVE & CORTEX INSTALLATION SUMMARY (DOCKER MODE) ===
+
+Installation Date: $(date)
+Deployment mode : docker (all services in containers)
+Stack directory : /opt/thehive-docker
+
+Container endpoints on this host:
+  TheHive   : http://$(hostname -I | awk '{print $1}'):9000
+  Cortex    : http://$(hostname -I | awk '{print $1}'):9001
+  Elastic   : http://$(hostname -I | awk '{print $1}'):9200
+  Cassandra : tcp/9042
+
+Check status:
+  cd /opt/thehive-docker
+  docker compose ps
+  docker compose logs thehive
+  docker compose logs cortex
+
+Default credentials:
+  TheHive : admin@thehive.local / secret   (first login, then change)
+  Cortex  : admin / admin                  (first login, then change)
+
+EOF
+
+    log_ok "Installation summary written to /root/thehive-installation-summary.txt"
+}
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 main() {
@@ -1396,40 +1594,60 @@ main() {
     validate_root
     validate_os
     check_system_resources
+    select_deploy_mode
     ensure_no_package_manager_running
     pre_cleanup
-    prepare_base_dirs
 
-    log_step "Starting full deployment pipeline..."
+    if [[ "${DEPLOY_MODE}" == "docker" ]]; then
+        log_step "Starting Docker-based deployment pipeline..."
 
-    install_dependencies
-    install_elasticsearch_if_missing
-    install_cassandra_if_missing
-    setup_elasticsearch
-    setup_cassandra
-    install_thehive
-    install_cortex
-    install_cortex_analyzers_repo
-    configure_thehive
-    configure_cortex
-    setup_systemd_services
-    start_services
-    wait_for_services
-    create_integration_script
-    create_health_check
-    finalize_installation
+        # Docker mode: no native ES/Cassandra/TheHive/Cortex packages
+        install_dependencies
+        install_docker_stack
+        finalize_installation_docker
+
+    else
+        log_step "Starting native (package-based) deployment pipeline..."
+
+        prepare_base_dirs
+        install_dependencies
+        install_elasticsearch_if_missing
+        install_cassandra_if_missing
+        setup_elasticsearch
+        setup_cassandra
+        install_thehive
+        install_cortex
+        install_cortex_analyzers_repo
+        configure_thehive
+        configure_cortex
+        setup_systemd_services
+        start_services
+        wait_for_services
+        create_integration_script
+        create_health_check
+        finalize_installation
+    fi
 
     echo ""
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║                    DEPLOYMENT COMPLETED                        ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Quick start:"
-    echo "  1) Run:  sudo /root/configure-integration.sh"
-    echo "  2) Check: check-thehive-status"
-    echo "  3) TheHive: http://$(hostname -I | awk '{print $1}'):9000"
-    echo "  4) Cortex : http://$(hostname -I | awk '{print $1}'):9001"
-    echo ""
+
+    if [[ "${DEPLOY_MODE}" == "docker" ]]; then
+        echo "Quick start (Docker mode):"
+        echo "  TheHive: http://$(hostname -I | awk '{print $1}'):9000"
+        echo "  Cortex : http://$(hostname -I | awk '{print $1}'):9001"
+        echo ""
+    else
+        echo "Quick start (native mode):"
+        echo "  1) Run:  sudo /root/configure-integration.sh"
+        echo "  2) Check: check-thehive-status"
+        echo "  3) TheHive: http://$(hostname -I | awk '{print $1}'):9000"
+        echo "  4) Cortex : http://$(hostname -I | awk '{print $1}'):9001"
+        echo ""
+    fi
+
     echo "Installation details saved to: /root/thehive-installation-summary.txt"
 }
 
