@@ -10,7 +10,7 @@ This environment supports incident response, automated enrichment, collaboration
 
 You can deploy the platform in **two ways**:
 
-1. **Automated deployment** using `deploy.sh`  
+1. **Automated deployment** using `deploy.sh` (with **Native** or **Docker** mode)  
 2. **Manual installation** (fully documented step-by-step)  
 3. Optional **Splunk integration** using `setup_thehive.sh`
 
@@ -22,6 +22,7 @@ You can deploy the platform in **two ways**:
 2. [Installed Components](#-installed-components)  
 3. [Requirements](#-requirements)  
 4. [Option A – Automated Deployment](#-option-a--automated-deployment-deploysh)  
+   - [Deployment Modes (Native vs Docker)](#deployment-modes-native-vs-docker)  
 5. [Option B – Manual Deployment](#-option-b--manual-deployment-step-by-step)  
    - [1. System Preparation](#1-system-preparation)  
    - [2. Install Elasticsearch 71729](#2-install-elasticsearch-71729)  
@@ -79,6 +80,8 @@ This deployment consists of four core services (plus optional reverse proxy):
 | Cassandra      | 4.1.x     | Distributed Database         | 9042 |
 | Java (OpenJDK) | 11        | Runtime Environment          | –    |
 
+> **Note:** In Docker mode the internal service ports remain the same, but are mapped to different host ports (see Docker section below).
+
 ---
 
 ## 📋 Requirements
@@ -89,7 +92,8 @@ This deployment consists of four core services (plus optional reverse proxy):
 - **Disk:** 50 GB+ (more for production)  
 - **Network:**
   - Outbound internet access (for packages/analyzers) or local mirrors
-  - Inbound access to ports: `9000` (TheHive), `9001` (Cortex), optionally `443` (Nginx)
+  - Inbound access to ports: `9000` (TheHive), `9001` (Cortex), optionally `443` (Nginx)  
+    - Or their mapped Docker host ports in Docker mode (`19000`, `19001`, `19200`, `19042`)
 
 ---
 
@@ -108,18 +112,109 @@ sudo ./deploy.sh
 The script will:
 
 - Stop and clean any existing TheHive/Cortex/ES/Cassandra data on the host  
-- Install:
+- Install (in **Native** mode):
   - Elasticsearch **7.17.29** (using `.deb`, e.g. Aliyun mirror in restricted networks)
   - Cassandra **4.1.x**
   - TheHive **5.2.16**
   - Cortex **3.1.8**
-- Configure systemd services
+- Or deploy (in **Docker** mode):
+  - A full containerized stack (Elasticsearch, Cassandra, Cortex, TheHive) using `docker-compose`
+- Configure services (systemd in Native mode, Docker stack in Docker mode)
 - Start all components
 - (Optionally) create helper scripts such as:
   - `configure-integration.sh` – for TheHive ↔ Cortex API integration
-  - `check-thehive-status` – basic health check
+  - `check-thehive-status` – basic health check for Native mode
 
 If you prefer not to rely on scripts at all, follow **Option B – Manual Deployment** below.
+
+### Deployment Modes (Native vs Docker)
+
+When you run `deploy.sh`, it will first detect your OS/resources, then ask how you want to deploy:
+
+```text
+[STEP]  Choose deployment mode for TheHive/Cortex on THIS host
+  1) Native  (OS packages: Elasticsearch, Cassandra, TheHive, Cortex)
+  2) Docker  (all services as containers via docker compose)
+Enter choice [1/2] (default: 1):
+```
+
+- **Option 1 – Native**
+  - Installs packages directly on the host (Elasticsearch, Cassandra, TheHive, Cortex).
+  - Uses `systemd` services:
+    - `elasticsearch`, `cassandra`, `cortex`, `thehive`
+  - Uses the **manual configuration paths** documented later in this README:
+    - `/etc/thehive/application.conf`
+    - `/etc/cortex/application.conf`
+    - etc.
+
+- **Option 2 – Docker**
+  - Uses Docker and `docker-compose` to deploy everything under `/opt/thehive-docker`.
+  - Generates `docker-compose.yml` similar to:
+
+    ```yaml
+    version: "3.8"
+
+    services:
+      elasticsearch:
+        image: "elasticsearch:7.17.9"
+        ports:
+          - "19200:9200"
+
+      cassandra:
+        image: cassandra:3.11
+        ports:
+          - "19042:9042"
+
+      cortex:
+        image: thehiveproject/cortex:3.1.8
+        ports:
+          - "19001:9001"
+
+      thehive:
+        image: strangebee/thehive:5.2.16
+        ports:
+          - "19000:9000"
+
+    volumes:
+      esdata_lab:
+      cassdata_lab:
+      cortex-jobs_lab:
+      cortex-logs_lab:
+      thehive-data_lab:
+    ```
+
+  - Resulting **access URLs** (Docker mode):
+
+    | Service    | URL                              | Notes                         |
+    |-----------|-----------------------------------|-------------------------------|
+    | TheHive   | `http://<server-ip>:19000`       | admin@thehive.local / secret |
+    | Cortex    | `http://<server-ip>:19001`       | admin / admin                |
+    | ES (HTTP) | `http://<server-ip>:19200`       | Elasticsearch API            |
+    | Cassandra | `tcp://<server-ip>:19042`        | CQL native transport         |
+
+  - To manage the Docker stack:
+
+    ```bash
+    cd /opt/thehive-docker
+
+    # See running containers
+    docker compose ps        # or: docker-compose ps
+
+    # View logs
+    docker compose logs thehive
+    docker compose logs cortex
+
+    # Stop and remove stack
+    docker compose down
+    ```
+
+In **Docker mode**, TheHive ↔ Cortex integration is still configured via the **UIs**:
+
+- Cortex: create an `orgAdmin` user and generate an API key  
+- TheHive: Administration → Connectors → Cortex → edit `local-cortex` and paste the API key
+
+In **Native mode**, you can either use the UI or add the API key directly to `/etc/thehive/application.conf` as described in  
+[10. Connect TheHive & Cortex](#10-connect-thehive-and-cortex-api-key-integration).
 
 ---
 
@@ -366,7 +461,7 @@ mkdir -p /etc/thehive
 
 cat > /etc/thehive/secret.conf << 'EOF'
 # IMPORTANT: Change this in production.
-play.http.secret.key="changeme_in_production_make_this_very_long_and_secure_12345"
+play.http.secret.key="changeme_in_production_make_THIS_very_long_and_secure_12345"
 EOF
 ```
 
@@ -743,15 +838,25 @@ systemctl restart thehive
 
 > ⚠️ Change all default credentials immediately after first login.
 
+In **Docker mode**, use:
+
+| Service | URL                            | Default Username       | Default Password |
+|--------|----------------------------------|------------------------|------------------|
+| TheHive | `http://<server-ip>:19000`     | `admin@thehive.local` | `secret`         |
+| Cortex  | `http://<server-ip>:19001`     | `admin`               | `admin`          |
+
 ---
 
 ### 10. Connect TheHive and Cortex (API Key Integration)
 
-This is the **final manual step**: using a Cortex API key (from an `org-admin` user) inside TheHive configuration and restarting TheHive.
+This is the **final manual step** (for Native mode): using a Cortex API key (from an `org-admin` user) inside TheHive configuration and restarting TheHive.
+
+> In **Docker mode**, the recommended way is to configure the API key fully via the **TheHive UI**  
+> (Administration → Connectors → Cortex) after generating it in Cortex.
 
 #### 10.1. Create an org admin user and API key in Cortex
 
-1. Open Cortex: `http://<server-ip>:9001`  
+1. Open Cortex: `http://<server-ip>:9001` (or `19001` in Docker mode)  
 2. Login with `admin / admin`  
 3. Go to **Organization → Users**  
 4. Create a new user:
@@ -759,7 +864,7 @@ This is the **final manual step**: using a Cortex API key (from an `org-admin` u
    - Roles: `orgAdmin`, `read`, `analyze`
 5. Generate an **API key** for this user and copy it.
 
-#### 10.2. Add the API key to TheHive configuration
+#### 10.2. Add the API key to TheHive configuration (Native mode)
 
 Edit `/etc/thehive/application.conf` and update the `cortex.servers` block:
 
@@ -795,17 +900,24 @@ systemctl restart thehive
 Now open TheHive → **Administration → Connectors → Cortex** and verify that `local-cortex` is **connected**.  
 Create a test case, add an observable, and run an Analyzer to confirm integration works.
 
+In **Docker mode**, instead of editing a file in the container image, you usually:
+
+1. Log in to TheHive UI (`http://<server-ip>:19000`).
+2. Go to **Administration → Connectors → Cortex**.
+3. Edit the existing Cortex server (`local-cortex`) and paste the API key into the UI form.
+4. Save and validate the connection.
+
 ---
 
 ## 🧪 Health Checks
 
-### Basic systemd status
+### Basic systemd status (Native mode)
 
 ```bash
 systemctl status elasticsearch cassandra cortex thehive --no-pager
 ```
 
-### API endpoints
+### API endpoints (Native mode)
 
 ```bash
 curl -s http://127.0.0.1:9200 | jq .     # Elasticsearch
@@ -813,18 +925,36 @@ curl -s http://127.0.0.1:9001/api/status # Cortex
 curl -s http://127.0.0.1:9000/api/status # TheHive
 ```
 
+### API endpoints (Docker mode, from host)
+
+```bash
+curl -s http://<server-ip>:19200 | jq .          # Elasticsearch
+curl -s http://<server-ip>:19001/api/status       # Cortex
+curl -s http://<server-ip>:19000/api/status       # TheHive
+```
+
 ### Useful logs
 
 ```bash
+# Native mode
 journalctl -u elasticsearch -n 50 --no-pager
 journalctl -u cassandra    -n 50 --no-pager
 journalctl -u cortex       -n 50 --no-pager
 journalctl -u thehive      -n 50 --no-pager
+
+# Docker mode
+cd /opt/thehive-docker
+docker compose logs thehive
+docker compose logs cortex
+docker compose logs elasticsearch
+docker compose logs cassandra
 ```
 
 ---
 
 ## 🗂️ Key Directories
+
+**Native mode**
 
 | Path                               | Description                    |
 |------------------------------------|--------------------------------|
@@ -838,19 +968,30 @@ journalctl -u thehive      -n 50 --no-pager
 | `/var/log/thehive/`                | TheHive logs                  |
 | `/var/log/cortex/`                 | Cortex logs                   |
 
+**Docker mode**
+
+| Path / Object                          | Description                           |
+|----------------------------------------|---------------------------------------|
+| `/opt/thehive-docker/docker-compose.yml` | Docker stack definition             |
+| `esdata_lab` volume                    | Elasticsearch data volume             |
+| `cassdata_lab` volume                  | Cassandra data volume                 |
+| `cortex-jobs_lab` volume               | Cortex jobs/workspace                 |
+| `cortex-logs_lab` volume               | Cortex logs                           |
+| `thehive-data_lab` volume              | TheHive data & attachments            |
+
 ---
 
 ## 📈 Production Recommendations
 
 - Use **HTTPS** (Nginx/Traefik + TLS certificates)
 - Change all default passwords and rotate keys regularly
-- Configure strict firewall rules for ports 9000/9001/9200/9042
+- Configure strict firewall rules for ports 9000/9001/9200/9042 (or Docker ports 19000/19001/19200/19042)
 - Move from single-node Cassandra to a multi-node cluster for HA
 - Tune JVM heap sizes based on real memory & load
 - Configure backup for:
   - Cassandra data
   - Elasticsearch indices
-  - TheHive files (`/opt/thp/thehive`)
+  - TheHive files (`/opt/thp/thehive`) or Docker volumes (`thehive-data_lab`, `esdata_lab`, `cassdata_lab`)
 
 ---
 
