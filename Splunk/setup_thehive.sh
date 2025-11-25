@@ -132,8 +132,8 @@ EOF
   echo "==> Testing Nginx configuration ..."
   nginx -t
 
-  echo "==> Reloading Nginx ..."
-  systemctl reload nginx
+  echo "==> Reloading / starting Nginx ..."
+  systemctl reload nginx 2>/dev/null || systemctl restart nginx || true
 fi
 
 #################################
