@@ -1,6 +1,21 @@
 #!/bin/bash
 # Full wipe of TheHive / Cortex / Elasticsearch / Cassandra environment
 # WARNING: DESTRUCTIVE OPERATION
+#
+# This script now also cleans Docker-based deployments of:
+#   - TheHive
+#   - Cortex
+#   - Elasticsearch
+#   - Cassandra
+#
+# It will:
+#   - Stop and disable systemd services (thehive, cortex, elasticsearch, cassandra)
+#   - Kill processes listening on ports 9000, 9001, 9200, 9042
+#   - Stop/remove Docker containers, volumes, networks, and (optionally) images
+#     related to TheHive/Cortex/ES/Cassandra (including /opt/thehive-docker stack)
+#   - Purge related packages
+#   - Remove config/data/log directories
+#   - Remove helper scripts and APT repo definitions
 
 set -euo pipefail
 
@@ -20,13 +35,13 @@ confirm() {
     fi
 
     echo -e "${RED}WARNING: This script will COMPLETELY REMOVE TheHive / Cortex / Elasticsearch / Cassandra.${NC}"
-    echo -e "${RED}All data, configs, and logs will be DELETED.${NC}"
+    echo -e "${RED}All data, configs, logs AND Docker stack (if any) will be DELETED.${NC}"
     read -rp "Type YES to continue: " ans
     [[ "$ans" == "YES" ]] || { log_warn "Aborted."; exit 1; }
 }
 
 stop_and_disable_services() {
-    log_info "Stopping and disabling services..."
+    log_info "Stopping and disabling systemd services..."
 
     for svc in thehive cortex elasticsearch cassandra; do
         if systemctl list-unit-files | grep -q "^${svc}.service"; then
@@ -38,6 +53,78 @@ stop_and_disable_services() {
             systemctl mask "${svc}" 2>/dev/null || true
         fi
     done
+}
+
+docker_cleanup() {
+    # Clean Docker-based deployments to avoid port conflicts and leftovers
+    if ! command -v docker >/dev/null 2>&1; then
+        log_info "Docker not installed, skipping Docker cleanup."
+        return 0
+    fi
+
+    log_info "Cleaning Docker resources related to TheHive / Cortex / ES / Cassandra..."
+
+    # 1) If our standard compose stack exists (/opt/thehive-docker), bring it down
+    local STACK_DIR="/opt/thehive-docker"
+    if [[ -f "${STACK_DIR}/docker-compose.yml" ]]; then
+        log_info "Found ${STACK_DIR}/docker-compose.yml - running 'docker compose down -v'..."
+        (
+            cd "${STACK_DIR}" && \
+            docker compose down -v 2>/dev/null || docker-compose down -v 2>/dev/null || true
+        )
+    fi
+
+    # 2) Stop and remove any other containers whose image or name suggests TheHive stack
+    local containers
+    containers=$(docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' \
+        | grep -Ei 'thehive|cortex|elasticsearch|cassandra' \
+        | awk '{print $1}' || true)
+
+    if [[ -n "${containers:-}" ]]; then
+        log_info "Stopping Docker containers: ${containers}"
+        docker stop ${containers} 2>/dev/null || true
+        log_info "Removing Docker containers: ${containers}"
+        docker rm -f ${containers} 2>/dev/null || true
+    else
+        log_info "No matching Docker containers found."
+    fi
+
+    # 3) Remove volumes whose names match the stack components
+    local volumes
+    volumes=$(docker volume ls --format '{{.Name}}' \
+        | grep -Ei 'thehive|cortex|elasticsearch|cassandra' || true)
+
+    if [[ -n "${volumes:-}" ]]; then
+        log_info "Removing Docker volumes: ${volumes}"
+        docker volume rm ${volumes} 2>/dev/null || true
+    else
+        log_info "No matching Docker volumes found."
+    fi
+
+    # 4) Remove networks related to TheHive stack
+    local networks
+    networks=$(docker network ls --format '{{.Name}}' \
+        | grep -Ei 'thehive|cortex|elasticsearch|cassandra' || true)
+
+    if [[ -n "${networks:-}" ]]; then
+        log_info "Removing Docker networks: ${networks}"
+        docker network rm ${networks} 2>/dev/null || true
+    else
+        log_info "No matching Docker networks found."
+    fi
+
+    # 5) Optionally remove images (they don't cause port conflict, but we wipe them for a clean lab)
+    local images
+    images=$(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+        | grep -Ei 'thehive|cortex|elasticsearch|cassandra' \
+        | awk '{print $2}' || true)
+
+    if [[ -n "${images:-}" ]]; then
+        log_info "Removing Docker images related to TheHive stack: ${images}"
+        docker rmi -f ${images} 2>/dev/null || true
+    else
+        log_info "No matching Docker images found."
+    fi
 }
 
 kill_ports() {
@@ -79,6 +166,7 @@ remove_dirs() {
            /opt/thehive \
            /opt/thp/thehive \
            /opt/cortex \
+           /opt/thehive-docker \
            /var/log/thehive \
            /var/log/cortex \
            /var/lib/thehive \
@@ -136,6 +224,7 @@ post_checks() {
         || echo "No related systemd unit files"
 
     ls -ld /etc/thehive /etc/cortex /opt/thehive /opt/thp/thehive /opt/cortex \
+           /opt/thehive-docker \
            /var/log/thehive /var/log/cortex \
            /var/lib/elasticsearch /var/log/elasticsearch \
            /var/lib/cassandra /var/log/cassandra 2>&1 \
@@ -147,6 +236,17 @@ post_checks() {
     grep -Rni 'thehive-project.org' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null \
         || echo "No TheHive APT entries found"
 
+    if command -v docker >/dev/null 2>&1; then
+        echo ""
+        log_info "Docker post-checks..."
+        docker ps -a --format 'CONTAINER: {{.ID}} {{.Image}} {{.Names}}' | grep -Ei 'thehive|cortex|elasticsearch|cassandra' \
+            || echo "No related Docker containers"
+        docker volume ls --format 'VOLUME: {{.Name}}' | grep -Ei 'thehive|cortex|elasticsearch|cassandra' \
+            || echo "No related Docker volumes"
+        docker network ls --format 'NETWORK: {{.Name}}' | grep -Ei 'thehive|cortex|elasticsearch|cassandra' \
+            || echo "No related Docker networks"
+    fi
+
     echo ""
 }
 
@@ -154,6 +254,7 @@ final_message() {
     echo ""
     echo "============================================="
     echo "  TheHive / Cortex / Elasticsearch / Cassandra WIPED"
+    echo "  (Packages + systemd + Docker stack cleaned)"
     echo "============================================="
     echo "Cleanup completed."
     echo ""
@@ -167,6 +268,7 @@ main() {
 
     confirm
     stop_and_disable_services
+    docker_cleanup
     kill_ports
     purge_packages
     remove_dirs
