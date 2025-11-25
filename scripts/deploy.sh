@@ -1,6 +1,6 @@
 #!/bin/bash
 # TheHive & Cortex Enterprise Deployment Script
-# Version: 3.1 - Full Reset (Native / Docker)
+# Version: 3.2 - Full Reset (Native / Docker)
 
 set -euo pipefail
 
@@ -43,7 +43,7 @@ print_banner() {
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║                                                                ║"
     echo "║           THEHIVE & CORTEX ENTERPRISE DEPLOYMENT              ║"
-    echo "║              Version 3.1 - Full Reset (Native/Docker)         ║"
+    echo "║              Version 3.2 - Full Reset (Native/Docker)         ║"
     echo "║                                                                ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -188,7 +188,7 @@ pre_cleanup() {
     done
 
     # Kill any process listening on the known ports
-    for port in 9000 9001 9200 9042; do
+    for port in 9000 9001 9200 9042 19000 19001 19200 19042; do
         local pids
         pids=$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $NF}' \
             | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u || true)
@@ -227,12 +227,10 @@ pre_cleanup() {
 prepare_base_dirs() {
     log_step "Preparing base directories and placeholder config files..."
 
-    # Directories used by TheHive & Cortex packages and postinst scripts
     mkdir -p /etc/thehive /etc/cortex
     mkdir -p /var/log/thehive /var/log/cortex
     mkdir -p /opt/thehive /opt/cortex
 
-    # Minimal placeholder config files for TheHive so postinst 'chown' will not fail
     if [[ ! -f /etc/thehive/application.conf ]]; then
         cat > /etc/thehive/application.conf << 'EOF'
 # Temporary placeholder TheHive configuration - overwritten by deploy.sh
@@ -300,7 +298,6 @@ install_elasticsearch_if_missing() {
 
     log_step "Installing Elasticsearch 7.17.29 (package not found)..."
 
-    # Add Elastic official APT repo if not already present
     if ! grep -Rqs "artifacts.elastic.co/packages/7.x/apt" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
         log_info "Adding Elastic 7.x APT repository..."
         mkdir -p /usr/share/keyrings
@@ -934,7 +931,6 @@ install_cortex_analyzers_repo() {
 setup_systemd_services() {
     log_step "Configuring systemd services for TheHive and Cortex..."
 
-    # TheHive systemd service unit
     cat > /etc/systemd/system/thehive.service << 'EOF'
 [Unit]
 Description=TheHive 5.2.16
@@ -973,7 +969,6 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 EOF
 
-    # Cortex systemd service unit
     cat > /etc/systemd/system/cortex.service << 'EOF'
 [Unit]
 Description=Cortex 3.1.8 - Observable Analysis Engine
@@ -1099,52 +1094,108 @@ wait_for_services() {
 }
 
 # ---------------------------------------------------------------------------
-# HELPER SCRIPTS (NATIVE MODE)
+# HEALTH CHECK HELPER (BOTH NATIVE + DOCKER)
 # ---------------------------------------------------------------------------
 create_health_check() {
     log_step "Creating health check helper script..."
 
     cat > /usr/local/bin/check-thehive-status << 'EOF'
 #!/bin/bash
+# Unified health check for:
+#  - Native services (systemd)
+#  - Docker stack (thehive-docker)
+
 echo "=== TheHive & Cortex Health Check ==="
 echo "Timestamp: $(date)"
 echo ""
 
+# Detect host IP (best-effort)
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+echo "Deployment overview:"
+echo "--------------------"
+echo "  Host IP              : ${HOST_IP:-unknown}"
+echo "  Native URLs (if used):"
+echo "    TheHive  : http://127.0.0.1:9000"
+echo "    Cortex   : http://127.0.0.1:9001"
+echo "    ES       : http://127.0.0.1:9200"
+echo "  Docker URLs (if used):"
+echo "    TheHive  : http://${HOST_IP:-localhost}:19000"
+echo "    Cortex   : http://${HOST_IP:-localhost}:19001"
+echo "    ES       : http://${HOST_IP:-localhost}:19200"
+echo ""
+
+echo "=== NATIVE SERVICES (systemd) ==="
 echo "Service Status:"
 echo "---------------"
-systemctl is-active thehive >/dev/null 2>&1 && echo "✅ TheHive: Running" || echo "❌ TheHive: Not running"
-systemctl is-active cortex  >/dev/null 2>&1 && echo "✅ Cortex: Running"  || echo "❌ Cortex: Not running"
-systemctl is-active elasticsearch >/dev/null 2>&1 && echo "✅ Elasticsearch: Running" || echo "❌ Elasticsearch: Not running"
-systemctl is-active cassandra    >/dev/null 2>&1 && echo "✅ Cassandra: Running"    || echo "❌ Cassandra: Not running"
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl is-active thehive >/dev/null 2>&1 && echo "✅ thehive.service: Running" || echo "❌ thehive.service: Not running"
+  systemctl is-active cortex  >/dev/null 2>&1 && echo "✅ cortex.service : Running" || echo "❌ cortex.service : Not running"
+  systemctl is-active elasticsearch >/dev/null 2>&1 && echo "✅ elasticsearch : Running" || echo "❌ elasticsearch : Not running"
+  systemctl is-active cassandra    >/dev/null 2>&1 && echo "✅ cassandra     : Running" || echo "❌ cassandra     : Not running"
+else
+  echo "systemctl not available on this system."
+fi
 
 echo ""
-echo "API Status:"
-echo "-----------"
-curl -s http://127.0.0.1:9000/api/status >/dev/null && echo "✅ TheHive API: Accessible" || echo "❌ TheHive API: Not accessible"
-curl -s http://127.0.0.1:9001/api/status >/dev/null && echo "✅ Cortex API: Accessible"  || echo "❌ Cortex API: Not accessible"
-curl -s http://127.0.0.1:9200           >/dev/null && echo "✅ Elasticsearch API: Accessible" || echo "❌ Elasticsearch API: Not accessible"
+echo "Native API Status:"
+echo "------------------"
+curl -s http://127.0.0.1:9000/api/status  >/dev/null 2>&1 && echo "✅ TheHive (native) API: Accessible"   || echo "❌ TheHive (native) API: Not accessible"
+curl -s http://127.0.0.1:9001/api/status  >/dev/null 2>&1 && echo "✅ Cortex  (native) API: Accessible"   || echo "❌ Cortex  (native) API: Not accessible"
+curl -s http://127.0.0.1:9200             >/dev/null 2>&1 && echo "✅ ES      (native) API: Accessible"   || echo "❌ ES      (native) API: Not accessible"
 
 echo ""
-echo "Top processes by memory:"
-echo "------------------------"
-ps aux --sort=-%mem | head -n 15 | awk 'NR==1 || /java|cassandra|elasticsearch|thehive|cortex/ {print $1, $2, $4, $11}'
+echo "=== DOCKER STACK (thehive-docker) ==="
+if command -v docker >/dev/null 2>&1; then
+  echo "Docker containers:"
+  echo "------------------"
+  # Try docker compose ps (plugin) first, fall back to docker-compose, then docker ps
+  if docker compose ps >/dev/null 2>&1; then
+    docker compose ps
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose ps
+  else
+    docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' | grep -E 'thehive|cortex|cassandra|elastic' || echo "No relevant containers running."
+  fi
+
+  echo ""
+  echo "Docker API Status:"
+  echo "------------------"
+  curl -s "http://${HOST_IP:-localhost}:19000/api/status" >/dev/null 2>&1 && echo "✅ TheHive (docker) API: Accessible" || echo "❌ TheHive (docker) API: Not accessible"
+  curl -s "http://${HOST_IP:-localhost}:19001/api/status" >/dev/null 2>&1 && echo "✅ Cortex  (docker) API: Accessible" || echo "❌ Cortex  (docker) API: Not accessible"
+  curl -s "http://${HOST_IP:-localhost}:19200"            >/dev/null 2>&1 && echo "✅ ES      (docker) API: Accessible" || echo "❌ ES      (docker) API: Not accessible"
+else
+  echo "Docker is not installed on this host."
+fi
 
 echo ""
-echo "Disk Space (/, /opt, /var/lib):"
-echo "-------------------------------"
-df -h / /opt /var/lib | grep -v tmpfs
-
-echo ""
-echo "Recent errors from TheHive and Cortex (last 10 lines each):"
+echo "Disk Space (/, /opt, /var/lib, /var/lib/docker if present):"
 echo "-----------------------------------------------------------"
-journalctl -u thehive --since "1 hour ago" | grep -i error | tail -10 || echo "No recent TheHive errors."
-journalctl -u cortex  --since "1 hour ago" | grep -i error | tail -10 || echo "No recent Cortex errors."
+df -h / /opt /var/lib /var/lib/docker 2>/dev/null | grep -v tmpfs
+
+echo ""
+echo "Recent native errors from TheHive and Cortex (last 10 lines each):"
+echo "------------------------------------------------------------------"
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl -u thehive --since "1 hour ago" | grep -i error | tail -10 || echo "No recent TheHive native errors."
+  journalctl -u cortex  --since "1 hour ago" | grep -i error | tail -10 || echo "No recent Cortex  native errors."
+else
+  echo "journalctl not available; skipping systemd logs."
+fi
+
+echo ""
+echo "Tip:"
+echo "  - If you're using Docker only, focus on the Docker API status and 'docker compose ps'."
+echo "  - If you're using native services only, focus on systemd service status and native APIs."
 EOF
 
     chmod +x /usr/local/bin/check-thehive-status
     log_ok "Health check script created at /usr/local/bin/check-thehive-status"
 }
 
+# ---------------------------------------------------------------------------
+# FINAL SUMMARY (NATIVE MODE)
+# ---------------------------------------------------------------------------
 finalize_installation_native() {
     log_step "Writing installation summary (native mode)..."
 
@@ -1188,10 +1239,7 @@ EOF
 # ---------------------------------------------------------------------------
 # DOCKER MODE: ENGINE + COMPOSE + STACK
 # ---------------------------------------------------------------------------
-
-# Wrapper to call docker compose or docker-compose depending on availability
 docker_run_compose() {
-    # usage: docker_run_compose [args...]
     if docker compose version >/dev/null 2>&1; then
         docker compose "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -1216,7 +1264,6 @@ docker_install_engine_and_compose() {
         log_info "Docker already installed."
     fi
 
-    # Install compose plugin / binary if needed
     if docker compose version >/dev/null 2>&1; then
         log_info "'docker compose' subcommand is available."
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -1242,7 +1289,6 @@ docker_write_compose_file() {
     log_info "Writing docker-compose.yml to /opt/thehive-docker"
 
     mkdir -p /opt/thehive-docker
-    # we need variable expansion here -> unquoted EOF
     cat > /opt/thehive-docker/docker-compose.yml << EOF
 version: "3.8"
 
@@ -1328,7 +1374,6 @@ docker_deploy_stack() {
     log_info "Waiting for services to come up (Docker mode)..."
     sleep 20
 
-    # Basic health check
     local host_ip
     host_ip=$(hostname -I | awk '{print $1}')
 
@@ -1381,6 +1426,9 @@ docker_final_summary() {
     echo "  docker compose logs thehive # see logs"
     echo "  docker compose down         # stop and remove containers"
     echo ""
+    echo "Health check:"
+    echo "  check-thehive-status"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1430,6 +1478,7 @@ main() {
         docker_install_engine_and_compose
         docker_write_compose_file
         docker_deploy_stack
+        create_health_check
         docker_final_summary
 
         echo ""
