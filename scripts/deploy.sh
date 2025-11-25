@@ -1,341 +1,377 @@
 #!/bin/bash
-# TheHive & Cortex Enterprise Deployment Script
-# Version: 3.2 - Full Reset (Native / Docker)
+# TheHive & Cortex Enterprise Deployment
+# Version: 3.4 - Full Reset (Native/Docker)
+#
+# WARNING: DESTRUCTIVE ON THIS HOST (for TheHive/Cortex/ES/Cassandra)
+# - Stops services
+# - Kills ports: 9000, 9001, 9200, 9042
+# - Removes config/data/logs of TheHive, Cortex, Elasticsearch, Cassandra
+#
+# Modes:
+#   1) Native:  Ubuntu/Debian packages + .deb (Elasticsearch via .deb fallback)
+#   2) Docker:  all stack via docker-compose (elasticsearch, cassandra, cortex, thehive)
+#
+# Use ONLY on a dedicated lab/PoC box.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# COLORS & LOGGING HELPERS
+# COLORS & LOG HELPERS
 # ---------------------------------------------------------------------------
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log_info()    { echo -e "${GREEN}[INFO]${NC}  $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error()   { echo -e "${RED}[FAIL]${NC}  $1"; }
-log_debug()   { echo -e "${BLUE}[DEBUG]${NC} $1"; }
-log_ok()      { echo -e "${GREEN}[OK]${NC}    $1"; }
 log_step()    { echo -e "${CYAN}[STEP]${NC}  $1"; }
+log_ok()      { echo -e "${GREEN}[OK]${NC}    $1"; }
+log_debug()   { echo -e "${BLUE}[DEBUG]${NC} $1"; }
 
-# Global RAM variable (detected in check_system_resources)
-RAM_GB=0
-
-# Script directory (used to look for local .deb packages)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Deployment mode: "native" or "docker"
-DEPLOY_MODE="native"
-
-# Default Elasticsearch Docker image (can be overridden by env ES_DOCKER_IMAGE)
-ES_DOCKER_IMAGE_DEFAULT="${ES_DOCKER_IMAGE:-elasticsearch:7.17.9}"
+RAM_GB=0
+DEPLOY_MODE="native"  # or "docker"
 
 # ---------------------------------------------------------------------------
 # BANNER
 # ---------------------------------------------------------------------------
 print_banner() {
-    clear || true
-    echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════════╗"
-    echo "║                                                                ║"
-    echo "║           THEHIVE & CORTEX ENTERPRISE DEPLOYMENT              ║"
-    echo "║              Version 3.2 - Full Reset (Native/Docker)         ║"
-    echo "║                                                                ║"
-    echo "╚════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo "This script can deploy on this host:"
-    echo "  • TheHive 5.2.16  (native) or 5.2.x (docker image)"
-    echo "  • Cortex  3.1.8"
-    echo "  • Elasticsearch 7.17.29"
-    echo "  • Cassandra 3.11/4.x"
-    echo "  • Java 11 (native mode)"
-    echo ""
-    echo "# ---------------------------------------------------------------------------! WARNING: All existing TheHive/Cortex/ES/Cassandra data on this host"
-    echo "# ---------------------------------------------------------------------------! will be wiped before installation (full reset)."
-    echo ""
+  clear || true
+  echo -e "${CYAN}"
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║                                                                ║"
+  echo "║           THEHIVE & CORTEX ENTERPRISE DEPLOYMENT              ║"
+  echo "║              Version 3.4 - Full Reset (Native/Docker)         ║"
+  echo "║                                                                ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  echo "This script can deploy on this host:"
+  echo "  • TheHive  5.2.16  (native) or 5.2.x (docker image)"
+  echo "  • Cortex   3.1.8"
+  echo "  • Elastic  7.17.29"
+  echo "  • Cassandra 3.11/4.x"
+  echo "  • Java 11 (native mode)"
+  echo ""
+  echo "# ---------------------------------------------------------------------------! WARNING: All existing TheHive/Cortex/ES/Cassandra data on this host"
+  echo "# ---------------------------------------------------------------------------! will be wiped before installation (full reset)."
+  echo ""
 }
 
 # ---------------------------------------------------------------------------
-# VALIDATION
+# BASIC VALIDATION
 # ---------------------------------------------------------------------------
 validate_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root. Abort."
-        exit 1
-    fi
-    log_ok "Running as root user."
+  if [[ $EUID -ne 0 ]]; then
+    log_error "This script must be run as root."
+    exit 1
+  fi
+  log_ok "Running as root user."
 }
 
 validate_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        log_error "Cannot determine OS distribution (/etc/os-release missing)."
-        exit 1
-    fi
-
-    # shellcheck disable=SC1091
-    source /etc/os-release
-
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        log_error "This script supports only Ubuntu/Debian. Detected: $PRETTY_NAME"
-        exit 1
-    fi
-
-    log_ok "OS detected: $PRETTY_NAME"
+  if [[ ! -f /etc/os-release ]]; then
+    log_error "/etc/os-release not found, cannot detect OS."
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+    log_error "Unsupported OS: $PRETTY_NAME. Only Ubuntu/Debian."
+    exit 1
+  fi
+  log_ok "OS detected: $PRETTY_NAME"
 }
 
 check_system_resources() {
-    log_step "Checking system resources..."
+  log_step "Checking system resources..."
 
-    RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
-    local free_disk
-    local cpu_cores
+  RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+  local free_disk
+  local cpu_cores
+  free_disk=$(df -h / | awk 'NR==2{print $4}')
+  cpu_cores=$(nproc)
 
-    free_disk=$(df -h / | awk 'NR==2{print $4}')
-    cpu_cores=$(nproc)
+  log_info "System Resources:"
+  log_info "  RAM:  ${RAM_GB}GB"
+  log_info "  Disk: ${free_disk} free"
+  log_info "  CPU:  ${cpu_cores} cores"
 
-    log_info "System Resources:"
-    log_info "  RAM:  ${RAM_GB}GB"
-    log_info "  Disk: ${free_disk} free"
-    log_info "  CPU:  ${cpu_cores} cores"
+  if [[ $RAM_GB -lt 8 ]]; then
+    log_warn "Recommended minimum RAM for production is 8GB (you have ${RAM_GB}GB)."
+    log_warn "This is still OK for lab / PoC, just slower."
+  fi
+}
 
-    if [[ $RAM_GB -lt 8 ]]; then
-        log_warn "Recommended minimum RAM for production is 8GB (you have ${RAM_GB}GB)."
-        log_warn "This setup will still work for lab / PoC, but services may be slow."
-    fi
+choose_deploy_mode() {
+  log_step "Choose deployment mode for TheHive/Cortex on THIS host"
+  echo "  1) Native  (OS packages: Elasticsearch, Cassandra, TheHive, Cortex)"
+  echo "  2) Docker  (all services as containers via docker compose)"
+  read -rp "Enter choice [1/2] (default: 1): " mode
 
-    if [[ $cpu_cores -lt 2 ]]; then
-        log_warn "Multiple CPU cores recommended for better performance."
-    fi
+  case "${mode:-1}" in
+    1)
+      DEPLOY_MODE="native"
+      ;;
+    2)
+      DEPLOY_MODE="docker"
+      ;;
+    *)
+      DEPLOY_MODE="native"
+      ;;
+  esac
+  log_info "Selected deployment mode: ${DEPLOY_MODE}"
 }
 
 # ---------------------------------------------------------------------------
-# SELECT DEPLOYMENT MODE (NATIVE / DOCKER)
-# ---------------------------------------------------------------------------
-choose_deployment_mode() {
-    log_step "Choose deployment mode for TheHive/Cortex on THIS host"
-    echo "  1) Native  (OS packages: Elasticsearch, Cassandra, TheHive, Cortex)"
-    echo "  2) Docker  (all services as containers via docker compose)"
-    read -rp "Enter choice [1/2] (default: 1): " choice
-
-    case "${choice:-1}" in
-        2)
-            DEPLOY_MODE="docker"
-            ;;
-        *)
-            DEPLOY_MODE="native"
-            ;;
-    esac
-
-    log_info "Selected deployment mode: ${DEPLOY_MODE}"
-}
-
-# ---------------------------------------------------------------------------
-# APT/DPKG LOCK HANDLING
+# PACKAGE MANAGER LOCK / SANITY
 # ---------------------------------------------------------------------------
 ensure_no_package_manager_running() {
-    log_step "Ensuring no other package manager (apt/dpkg) is running..."
+  log_step "Ensuring no other package manager (apt/dpkg) is running..."
 
-    local attempts=0
-    while pgrep -x apt >/dev/null 2>&1 \
-       || pgrep -x apt-get >/dev/null 2>&1 \
-       || pgrep -x apt-cache >/dev/null 2>&1 \
-       || pgrep -x dpkg >/dev/null 2>&1 \
-       || pgrep -x unattended-upgrade >/dev/null 2>&1; do
+  local attempts=0
+  while pgrep -x apt >/dev/null 2>&1 \
+     || pgrep -x apt-get >/dev/null 2>&1 \
+     || pgrep -x dpkg >/dev/null 2>&1 \
+     || pgrep -x unattended-upgrade >/dev/null 2>&1; do
 
-        attempts=$((attempts + 1))
-        if [[ $attempts -eq 1 ]]; then
-            log_warn "Another apt/dpkg process is currently running. Waiting for it to finish..."
-        fi
-
-        if [[ $attempts -gt 30 ]]; then
-            log_error "apt/dpkg is still running after several minutes."
-            log_error "Please finish or stop any running package operations and re-run this script."
-            exit 1
-        fi
-
-        sleep 10
-    done
-
-    if [[ -f /var/lib/dpkg/lock-frontend ]]; then
-        log_warn "dpkg frontend lock file exists but no apt/dpkg processes are running."
-        log_warn "If you previously had a crashed apt/dpkg, you may need to clean it manually."
+    attempts=$((attempts + 1))
+    if [[ $attempts -eq 1 ]]; then
+      log_warn "Another apt/dpkg process is currently running. Waiting..."
     fi
 
-    log_info "Running 'dpkg --configure -a' to fix any half-configured packages (if any)..."
-    if ! dpkg --configure -a >/dev/null 2>&1; then
-        log_warn "dpkg --configure -a returned non-zero; continuing anyway."
+    if [[ $attempts -gt 30 ]]; then
+      log_error "apt/dpkg is still running after several minutes."
+      exit 1
     fi
 
-    log_ok "Package manager state looks sane enough to continue."
+    sleep 10
+  done
+
+  if [[ -f /var/lib/dpkg/lock-frontend ]]; then
+    log_warn "dpkg frontend lock exists but no apt/dpkg processes."
+    log_warn "If there was a crash, you may need manual cleanup."
+  fi
+
+  log_info "Running 'dpkg --configure -a' (just in case)..."
+  dpkg --configure -a >/dev/null 2>&1 || true
+  log_ok "Package manager state looks sane enough to continue."
 }
 
 # ---------------------------------------------------------------------------
-# HARD RESET OF SERVICES, PORTS AND DIRECTORIES (DESTRUCTIVE)
+# PRE-CLEANUP (DESTRUCTIVE)
 # ---------------------------------------------------------------------------
 pre_cleanup() {
-    log_step "Stopping services and cleaning previous installation state (DESTRUCTIVE)..."
+  log_step "Stopping services and cleaning previous installation state (DESTRUCTIVE)..."
 
-    # Stop services if they exist
-    for svc in thehive cortex elasticsearch cassandra; do
-        if systemctl list-unit-files | grep -q "^${svc}.service"; then
-            log_info "Stopping service: ${svc}"
-            systemctl stop "${svc}" 2>/dev/null || true
-        fi
-    done
+  for svc in thehive cortex elasticsearch cassandra; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
+      log_info "Stopping service: ${svc}"
+      systemctl stop "${svc}" 2>/dev/null || true
+      systemctl disable "${svc}" 2>/dev/null || true
+      systemctl reset-failed "${svc}" 2>/dev/null || true
+    fi
+  done
 
-    # Kill any process listening on the known ports
-    for port in 9000 9001 9200 9042 19000 19001 19200 19042; do
-        local pids
-        pids=$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $NF}' \
-            | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u || true)
-        if [[ -n "${pids:-}" ]]; then
-            log_warn "Force-killing processes still listening on port ${port}: ${pids}"
-            kill -9 $pids 2>/dev/null || true
-        fi
-    done
+  # Kill any leftovers on ports
+  for port in 9000 9001 9200 9042; do
+    local pids
+    pids=$(ss -lntp 2>/dev/null \
+      | awk -v p=":${port}" '$4 ~ p {print $NF}' \
+      | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' \
+      | sort -u || true)
+    if [[ -n "${pids:-}" ]]; then
+      log_warn "Force-killing PIDs on port ${port}: ${pids}"
+      kill -9 $pids 2>/dev/null || true
+    fi
+  done
 
-    log_warn "Removing previous TheHive/Cortex/Elasticsearch/Cassandra config, data and logs..."
+  log_warn "Removing previous TheHive/Cortex/Elasticsearch/Cassandra config, data and logs..."
 
-    # TheHive & Cortex configs, binaries, data, logs
-    rm -rf /etc/thehive /etc/cortex
-    rm -rf /opt/thehive /opt/thp/thehive /opt/cortex
-    rm -rf /var/log/thehive /var/log/cortex
+  rm -rf /etc/thehive /etc/cortex
+  rm -rf /opt/thehive /opt/thp/thehive /opt/cortex
+  rm -rf /var/log/thehive /var/log/cortex
+  rm -rf /var/lib/thehive /var/lib/cortex
 
-    # Elasticsearch data & logs
-    rm -rf /var/lib/elasticsearch/* 2>/dev/null || true
-    rm -rf /var/log/elasticsearch/* 2>/dev/null || true
+  rm -rf /var/lib/elasticsearch /var/log/elasticsearch
+  rm -rf /var/lib/cassandra /var/log/cassandra
 
-    # Cassandra data & logs
-    rm -rf /var/lib/cassandra/data/* 2>/dev/null || true
-    rm -rf /var/lib/cassandra/commitlog/* 2>/dev/null || true
-    rm -rf /var/lib/cassandra/saved_caches/* 2>/dev/null || true
-    rm -rf /var/log/cassandra/* 2>/dev/null || true
+  # Old .deb leftovers
+  rm -f /tmp/thehive_5.2.*.deb /tmp/cortex_3.1.*.deb /tmp/elasticsearch-7.17.29-amd64.deb
 
-    # Docker stack directory (if exists)
-    rm -rf /opt/thehive-docker 2>/dev/null || true
-
-    log_ok "Previous installation state removed (full reset)."
+  log_ok "Previous installation state removed (full reset)."
 }
 
 # ---------------------------------------------------------------------------
-# PREPARE BASE DIRECTORIES + PLACEHOLDER CONFIGS (NATIVE MODE)
+# BASE DIRS FOR NATIVE
 # ---------------------------------------------------------------------------
 prepare_base_dirs() {
-    log_step "Preparing base directories and placeholder config files..."
+  log_step "Preparing base directories and placeholder config files..."
 
-    mkdir -p /etc/thehive /etc/cortex
-    mkdir -p /var/log/thehive /var/log/cortex
-    mkdir -p /opt/thehive /opt/cortex
+  mkdir -p /etc/thehive /etc/cortex
+  mkdir -p /var/log/thehive /var/log/cortex
+  mkdir -p /opt/thehive /opt/cortex
+  mkdir -p /opt/thp/thehive
 
-    if [[ ! -f /etc/thehive/application.conf ]]; then
-        cat > /etc/thehive/application.conf << 'EOF'
-# Temporary placeholder TheHive configuration - overwritten by deploy.sh
+  # Minimum placeholder so postinst does not fail
+  if [[ ! -f /etc/thehive/application.conf ]]; then
+    cat > /etc/thehive/application.conf << 'EOF'
 play.http.secret.key="temporary_placeholder_secret"
 EOF
-    fi
+  fi
 
-    if [[ ! -f /etc/thehive/logback.xml ]]; then
-        cat > /etc/thehive/logback.xml << 'EOF'
+  if [[ ! -f /etc/thehive/logback.xml ]]; then
+    cat > /etc/thehive/logback.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
-        </encoder>
-    </appender>
-    <root level="INFO">
-        <appender-ref ref="STDOUT" />
-    </root>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
+    </encoder>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="STDOUT"/>
+  </root>
 </configuration>
 EOF
-    fi
+  fi
 
-    log_ok "Base directories and placeholder config files prepared."
+  log_ok "Base directories and placeholder config files prepared."
 }
 
 # ---------------------------------------------------------------------------
-# DEPENDENCIES
+# SYSTEM DEPENDENCIES
 # ---------------------------------------------------------------------------
 install_dependencies() {
-    log_step "Installing system dependencies..."
+  log_step "Installing system dependencies..."
 
-    if ! apt-get update; then
-        log_warn "apt-get update returned non-zero. Check your APT sources if something fails later."
-    fi
+  if ! apt-get update; then
+    log_warn "apt-get update failed, continuing anyway (check your repos if issues appear)."
+  fi
 
-    apt-get install -y \
-        curl \
-        wget \
-        gnupg2 \
-        software-properties-common \
-        apt-transport-https \
-        ca-certificates \
-        openjdk-11-jdk \
-        haveged \
-        python3 \
-        python3-pip \
-        git \
-        tree \
-        jq \
-        net-tools \
-        lsof
+  apt-get install -y \
+    curl wget gnupg2 software-properties-common \
+    apt-transport-https ca-certificates \
+    openjdk-11-jdk haveged \
+    python3 python3-pip \
+    git tree jq net-tools lsof || true
 
-    log_ok "System dependencies installed."
+  log_ok "System dependencies installed."
 }
 
 # ---------------------------------------------------------------------------
-# ELASTICSEARCH INSTALL + CONFIG (NATIVE MODE)
+# ELASTICSEARCH INSTALL (APT + .DEB FALLBACK)
 # ---------------------------------------------------------------------------
 install_elasticsearch_if_missing() {
+  if dpkg -s elasticsearch >/dev/null 2>&1; then
+    log_info "Elasticsearch package already installed."
+    return 0
+  fi
+
+  log_step "Installing Elasticsearch 7.17.29 (package not found)..."
+
+  # Try to ensure Elastic 7.x repo exists (best-effort)
+  if ! grep -Rqs "artifacts.elastic.co/packages/7.x/apt" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    log_info "Adding Elastic 7.x APT repository..."
+    mkdir -p /usr/share/keyrings
+    curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch \
+      | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/7.x/apt stable main" \
+      > /etc/apt/sources.list.d/elasticsearch-7.x.list
+  else
+    log_info "Elastic 7.x APT repository already configured."
+  fi
+
+  if ! apt-get update; then
+    log_warn "apt-get update returned non-zero when installing Elasticsearch."
+  fi
+
+  # 1) Try official APT repo
+  if apt-get install -y elasticsearch; then
     if dpkg -s elasticsearch >/dev/null 2>&1; then
-        log_info "Elasticsearch package already installed."
-        return 0
+      log_ok "Elasticsearch installed from APT repository."
+      return 0
     fi
+  fi
 
-    log_step "Installing Elasticsearch 7.17.29 (package not found)..."
+  log_warn "apt-get install elasticsearch failed or package not found. Falling back to .deb installation..."
 
-    if ! grep -Rqs "artifacts.elastic.co/packages/7.x/apt" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
-        log_info "Adding Elastic 7.x APT repository..."
-        mkdir -p /usr/share/keyrings
-        curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch \
-            | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/7.x/apt stable main" \
-            > /etc/apt/sources.list.d/elasticsearch-7.x.list
-    else
-        log_info "Elastic 7.x APT repository already configured."
+  # 2) Fallback to .deb (Aliyun mirror or ES_DEB_URL override)
+  local es_deb="elasticsearch-7.17.29-amd64.deb"
+  local es_url_default="https://mirrors.aliyun.com/elasticstack/apt/7.x/pool/main/e/elasticsearch/${es_deb}"
+  local es_url="${ES_DEB_URL:-$es_url_default}"
+  local es_path=""
+
+  if [[ -f "/tmp/${es_deb}" ]]; then
+    log_info "Using existing local Elasticsearch package: /tmp/${es_deb}"
+    es_path="/tmp/${es_deb}"
+  elif [[ -f "${SCRIPT_DIR}/${es_deb}" ]]; then
+    log_info "Using existing local Elasticsearch package: ${SCRIPT_DIR}/${es_deb}"
+    es_path="${SCRIPT_DIR}/${es_deb}"
+  else
+    log_info "Downloading Elasticsearch package from: ${es_url}"
+    if ! wget -q "${es_url}" -O "/tmp/${es_deb}"; then
+      log_error "Failed to download Elasticsearch package from ${es_url}."
+      log_error "Place ${es_deb} in /tmp or ${SCRIPT_DIR}, or set ES_DEB_URL to your own mirror."
+      exit 1
     fi
+    es_path="/tmp/${es_deb}"
+  fi
 
-    if ! apt-get update; then
-        log_warn "apt-get update returned non-zero when installing Elasticsearch. Check your APT sources."
-    fi
+  dpkg -i "${es_path}" || true
+  apt-get install -f -y || true
 
-    if apt-get install -y elasticsearch; then
-        if dpkg -s elasticsearch >/dev/null 2>&1; then
-            log_ok "Elasticsearch package installed from official APT repository."
-            return 0
-        fi
-    fi
-
-    log_error "Elasticsearch installation failed; please install manually and re-run (native mode only)."
+  if dpkg -s elasticsearch >/dev/null 2>&1; then
+    log_ok "Elasticsearch 7.17.29 installed via .deb."
+  else
+    log_error "Elasticsearch installation via .deb failed; please fix manually and re-run (native mode only)."
     exit 1
+  fi
 }
 
+# ---------------------------------------------------------------------------
+# CASSANDRA INSTALL
+# ---------------------------------------------------------------------------
+install_cassandra_if_missing() {
+  if dpkg -s cassandra >/dev/null 2>&1; then
+    log_info "Cassandra package already installed."
+    # از همین‌جا مطمئن می‌شیم اگر قبلاً mask شده، آزادش کنیم
+    systemctl unmask cassandra 2>/dev/null || true
+    return 0
+  fi
+
+  log_step "Installing Cassandra (from configured APT repos)..."
+
+  if ! apt-get update; then
+    log_warn "apt-get update failed before Cassandra install."
+  fi
+
+  if ! apt-get install -y cassandra; then
+    log_error "Cassandra installation failed; please check your APT Cassandra repos."
+    exit 1
+  fi
+
+  # VERY IMPORTANT: unmask if masked (مثل لاگ خودت)
+  systemctl unmask cassandra 2>/dev/null || true
+
+  log_ok "Cassandra package installed."
+}
+
+# ---------------------------------------------------------------------------
+# ELASTICSEARCH CONFIG
+# ---------------------------------------------------------------------------
 setup_elasticsearch() {
-    log_step "Configuring Elasticsearch 7.17.29..."
+  log_step "Configuring Elasticsearch 7.17.29..."
 
-    if ! dpkg -s elasticsearch >/dev/null 2>&1; then
-        log_error "Elasticsearch package is NOT installed. Something went wrong earlier."
-        exit 1
-    fi
+  if ! dpkg -s elasticsearch >/dev/null 2>&1; then
+    log_error "Elasticsearch package is not installed (setup_elasticsearch)."
+    exit 1
+  fi
 
-    cat > /etc/elasticsearch/elasticsearch.yml << 'EOF'
-# ======================== Elasticsearch Configuration =========================
-# Single-node configuration optimized for TheHive & Cortex
-
+  cat > /etc/elasticsearch/elasticsearch.yml << 'EOF'
 cluster.name: thehive-cortex-cluster
 node.name: thehive-node-1
 
@@ -348,116 +384,73 @@ http.port: 9200
 discovery.type: single-node
 
 bootstrap.memory_lock: true
-
 xpack.security.enabled: false
 
 thread_pool.write.queue_size: 1000
 thread_pool.search.queue_size: 1000
 EOF
 
-    if [[ -f /etc/elasticsearch/jvm.options ]]; then
-        log_info "Tuning Elasticsearch JVM heap in /etc/elasticsearch/jvm.options ..."
-        if [[ $RAM_GB -ge 8 ]]; then
-            sed -i 's/^-Xms[0-9]\+g/-Xms2g/' /etc/elasticsearch/jvm.options || true
-            sed -i 's/^-Xmx[0-9]\+g/-Xmx2g/' /etc/elasticsearch/jvm.options || true
-        else
-            sed -i 's/^-Xms[0-9]\+g/-Xms1g/' /etc/elasticsearch/jvm.options || true
-            sed -i 's/^-Xmx[0-9]\+g/-Xmx1g/' /etc/elasticsearch/jvm.options || true
-        fi
-    else
-        log_warn "/etc/elasticsearch/jvm.options not found, skipping heap tuning."
+  if [[ -f /etc/elasticsearch/jvm.options ]]; then
+    log_info "Tuning Elasticsearch JVM heap..."
+    sed -i 's/^-Xms[0-9]\+[mgMG]/-Xms1g/' /etc/elasticsearch/jvm.options || true
+    sed -i 's/^-Xmx[0-9]\+[mgMG]/-Xmx1g/' /etc/elasticsearch/jvm.options || true
+  fi
+
+  mkdir -p /var/lib/elasticsearch /var/log/elasticsearch
+  chown -R elasticsearch:elasticsearch /var/lib/elasticsearch /var/log/elasticsearch
+
+  systemctl daemon-reload || true
+  systemctl enable elasticsearch || true
+  systemctl restart elasticsearch || true
+
+  log_info "Waiting for Elasticsearch on http://127.0.0.1:9200 ..."
+  local tries=0
+  until curl -s http://127.0.0.1:9200 >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [[ $tries -gt 30 ]]; then
+      log_warn "Elasticsearch did not become ready in time; check logs."
+      break
     fi
+    sleep 5
+  done
 
-    if ! grep -q "elasticsearch - nofile" /etc/security/limits.conf 2>/dev/null; then
-        echo "elasticsearch - nofile 65536" >> /etc/security/limits.conf
-    fi
-    if ! grep -q "elasticsearch - memlock" /etc/security/limits.conf 2>/dev/null; then
-        echo "elasticsearch - memlock unlimited" >> /etc/security/limits.conf
-    fi
-
-    mkdir -p /var/lib/elasticsearch /var/log/elasticsearch
-
-    systemctl daemon-reload || true
-    systemctl enable elasticsearch || true
-    systemctl restart elasticsearch
-
-    log_info "Waiting for Elasticsearch to start (http://127.0.0.1:9200)..."
-    local tries=0
-    until curl -s http://127.0.0.1:9200 >/dev/null 2>&1; do
-        tries=$((tries + 1))
-        if [[ $tries -gt 30 ]]; then
-            log_error "Elasticsearch did not become ready in time."
-            log_error "Check logs with: journalctl -u elasticsearch -n 50 --no-pager"
-            exit 1
-        fi
-        sleep 5
-    done
-
-    log_ok "Elasticsearch is up and running."
+  log_ok "Elasticsearch setup step completed."
 }
 
 # ---------------------------------------------------------------------------
-# CASSANDRA INSTALL + CONFIG (NATIVE MODE)
+# CASSANDRA CONFIG
 # ---------------------------------------------------------------------------
-install_cassandra_if_missing() {
-    if dpkg -s cassandra >/dev/null 2>&1; then
-        log_info "Cassandra package already installed."
-        return 0
-    fi
-
-    log_step "Installing Cassandra (3.11/4.x)..."
-
-    if ! apt-get update; then
-        log_warn "apt-get update returned non-zero when installing Cassandra. Check your APT sources."
-    fi
-
-    apt-get install -y cassandra
-
-    if dpkg -s cassandra >/dev/null 2>&1; then
-        log_ok "Cassandra package installed."
-        systemctl stop cassandra || true
-    else
-        log_error "Cassandra installation failed. Please install it manually and re-run this script."
-        exit 1
-    fi
-}
-
 setup_cassandra() {
-    log_step "Configuring Cassandra database..."
+  log_step "Configuring Cassandra (single-node)..."
 
-    if ! dpkg -s cassandra >/dev/null 2>&1; then
-        log_error "Cassandra package is NOT installed. Something went wrong earlier."
-        exit 1
-    fi
+  if ! dpkg -s cassandra >/dev/null 2>&1; then
+    log_error "Cassandra package is not installed (setup_cassandra)."
+    exit 1
+  fi
 
-    systemctl stop cassandra || true
+  # خیلی مهم: اگر سرویس ماسک شده بود، آزادش کن
+  systemctl unmask cassandra 2>/dev/null || true
 
-    log_info "Hard-resetting Cassandra data and logs..."
-    rm -rf /var/lib/cassandra/data/* \
-           /var/lib/cassandra/commitlog/* \
-           /var/lib/cassandra/saved_caches/* \
-           /var/log/cassandra/*
+  systemctl stop cassandra || true
 
-    mkdir -p /var/lib/cassandra/data \
-             /var/lib/cassandra/commitlog \
-             /var/lib/cassandra/saved_caches \
-             /var/log/cassandra
+  # Clean directories to avoid cluster_name mismatch
+  rm -rf /var/lib/cassandra /var/log/cassandra
+  mkdir -p /var/lib/cassandra/data \
+           /var/lib/cassandra/commitlog \
+           /var/lib/cassandra/saved_caches \
+           /var/log/cassandra
 
-    chown -R cassandra:cassandra /var/lib/cassandra /var/log/cassandra
+  chown -R cassandra:cassandra /var/lib/cassandra /var/log/cassandra
 
-    if [[ -f /etc/cassandra/cassandra.yaml && ! -f /etc/cassandra/cassandra.yaml.orig ]]; then
-        cp /etc/cassandra/cassandra.yaml /etc/cassandra/cassandra.yaml.orig
-        log_info "Backed up /etc/cassandra/cassandra.yaml to /etc/cassandra/cassandra.yaml.orig"
-    fi
+  if [[ -f /etc/cassandra/cassandra.yaml && ! -f /etc/cassandra/cassandra.yaml.orig ]]; then
+    cp /etc/cassandra/cassandra.yaml /etc/cassandra/cassandra.yaml.orig
+  fi
 
-    cat > /etc/cassandra/cassandra.yaml << 'EOF'
-# Cassandra configuration for a single-node TheHive / Cortex deployment
-# Tuned for small lab environments.
-
+  cat > /etc/cassandra/cassandra.yaml << 'EOF'
 cluster_name: 'TheHive Cluster'
 
-partitioner: org.apache.cassandra.dht.Murmur3Partitioner
 num_tokens: 16
+partitioner: org.apache.cassandra.dht.Murmur3Partitioner
 
 listen_address: 127.0.0.1
 rpc_address: 127.0.0.1
@@ -467,152 +460,139 @@ seed_provider:
     parameters:
       - seeds: "127.0.0.1"
 
-commitlog_sync: periodic
-commitlog_sync_period: 10000ms
-
-authenticator: AllowAllAuthenticator
-authorizer: AllowAllAuthorizer
-
 data_file_directories:
   - /var/lib/cassandra/data
 
 commitlog_directory: /var/lib/cassandra/commitlog
 saved_caches_directory: /var/lib/cassandra/saved_caches
 
-hinted_handoff_enabled: true
-max_hint_window: 3h
+commitlog_sync: periodic
+commitlog_sync_period: 10000ms
 
-endpoint_snitch: SimpleSnitch
+authenticator: AllowAllAuthenticator
+authorizer: AllowAllAuthorizer
 
 start_native_transport: true
 native_transport_port: 9042
+
+endpoint_snitch: SimpleSnitch
 EOF
 
-    chown cassandra:cassandra /etc/cassandra/cassandra.yaml
+  if [[ -f /etc/cassandra/jvm-server.options ]]; then
+    sed -i -E 's/^-Xms[0-9]+[mMgG]/-Xms512M/' /etc/cassandra/jvm-server.options || true
+    sed -i -E 's/^-Xmx[0-9]+[mMgG]/-Xmx512M/' /etc/cassandra/jvm-server.options || true
+  fi
 
-    if [[ -f /etc/cassandra/jvm-server.options ]]; then
-        log_info "Tuning Cassandra JVM heap in /etc/cassandra/jvm-server.options ..."
-        if [[ $RAM_GB -lt 8 ]]; then
-            sed -i -E 's/^-Xms[0-9]+[mMgG]/-Xms512M/' /etc/cassandra/jvm-server.options || true
-            sed -i -E 's/^-Xmx[0-9]+[mMgG]/-Xmx512M/' /etc/cassandra/jvm-server.options || true
-        else
-            sed -i -E 's/^-Xms[0-9]+[mMgG]/-Xms1G/' /etc/cassandra/jvm-server.options || true
-            sed -i -E 's/^-Xmx[0-9]+[mMgG]/-Xmx1G/' /etc/cassandra/jvm-server.options || true
-        fi
-    else
-        log_warn "/etc/cassandra/jvm-server.options not found; skipping Cassandra heap tuning."
+  systemctl enable cassandra || true
+  systemctl start cassandra || true
+
+  log_info "Waiting for Cassandra port 9042..."
+  local tries=0
+  while ! ss -lntp 2>/dev/null | awk '$4 ~ /:9042$/ {found=1} END{exit !found}'; do
+    tries=$((tries + 1))
+    if [[ $tries -gt 60 ]]; then
+      log_warn "Cassandra port 9042 not detected in time."
+      break
     fi
+    sleep 2
+  done
 
-    systemctl enable cassandra || true
-    systemctl start cassandra || true
-
-    log_info "Waiting for Cassandra native transport (port 9042)..."
-    local tries=0
-    local port_ok=0
-    while [[ $tries -lt 120 ]]; do
-        if ss -lntp 2>/dev/null | awk '$4 ~ /:9042$/ {found=1} END{exit !found}'; then
-            port_ok=1
-            break
-        fi
-        tries=$((tries + 1))
-        sleep 2
-    done
-
-    if [[ $port_ok -eq 1 ]]; then
-        log_ok "Cassandra is listening on port 9042."
-    else
-        log_warn "Cassandra native transport on port 9042 was not detected within the timeout window."
-        log_warn "It may still be starting slowly or bound to a specific interface. Continuing anyway."
-    fi
-
-    log_info "Waiting for Cassandra to respond to cqlsh..."
-    tries=0
-    local cql_ok=0
-    while [[ $tries -lt 60 ]]; do
-        if cqlsh -e "DESCRIBE KEYSPACES" >/dev/null 2>&1; then
-            cql_ok=1
-            log_ok "Cassandra responds to cqlsh."
-            break
-        fi
-        tries=$((tries + 1))
-        sleep 4
-    done
-
-    if [[ $cql_ok -eq 0 ]]; then
-        log_warn "cqlsh could not connect to Cassandra within the timeout window."
-        log_warn "Check system logs and /var/log/cassandra/*.log for detailed error messages. Continuing anyway."
-    fi
-
-    if cqlsh -e "CREATE KEYSPACE IF NOT EXISTS thehive WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};" >/dev/null 2>&1; then
-        log_ok "TheHive keyspace created or already present in Cassandra."
-    else
-        log_warn "Failed to create or verify 'thehive' keyspace. You may need to create it manually later."
-    fi
+  log_info "Trying to create 'thehive' keyspace..."
+  if cqlsh -e "CREATE KEYSPACE IF NOT EXISTS thehive WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};" >/dev/null 2>&1; then
+    log_ok "Keyspace 'thehive' is present."
+  else
+    log_warn "Could not create 'thehive' keyspace; please check Cassandra logs if needed."
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# THEHIVE INSTALL + CONFIG (NATIVE MODE)
+# THEHIVE INSTALL (NATIVE)
 # ---------------------------------------------------------------------------
 install_thehive() {
-    log_step "Installing TheHive 5.2.16..."
+  log_step "Installing TheHive 5.2.16..."
 
-    cd /tmp
+  cd /tmp
+  local pkg="thehive_5.2.16-1_all.deb"
+  local url_default="https://thehive.download.strangebee.com/5.2/deb/${pkg}"
+  local url="${THEHIVE_DEB_URL:-$url_default}"
 
-    local pkg_name="thehive_5.2.16-1_all.deb"
-    local default_url="https://thehive.download.strangebee.com/5.2/deb/${pkg_name}"
-    local thehive_url="${THEHIVE_DEB_URL:-$default_url}"
-
-    if [[ -f "/tmp/${pkg_name}" ]]; then
-        log_info "Using existing local TheHive package: /tmp/${pkg_name}"
-    else
-        log_info "Downloading TheHive package from: ${thehive_url}"
-        if ! wget -q "${thehive_url}" -O "${pkg_name}"; then
-            log_error "Failed to download TheHive package from ${thehive_url}."
-            log_error "You can place ${pkg_name} in /tmp or set THEHIVE_DEB_URL to your own mirror."
-            exit 1
-        fi
+  if [[ -f "/tmp/${pkg}" ]]; then
+    log_info "Using local TheHive package: /tmp/${pkg}"
+  else
+    log_info "Downloading TheHive from: ${url}"
+    if ! wget -q "${url}" -O "${pkg}"; then
+      log_error "Failed to download TheHive package from ${url}."
+      exit 1
     fi
+  fi
 
-    dpkg -i "${pkg_name}" || true
-    apt-get install -f -y
+  dpkg -i "${pkg}" || true
+  apt-get install -f -y || true
 
-    if dpkg -l | grep -qi "^ii\s\+thehive\s\+5.2.16"; then
-        log_ok "TheHive 5.2.16 package installed."
-    else
-        log_warn "TheHive 5.2.16 package installation may have issues – verify with: dpkg -l | grep thehive"
-    fi
+  if dpkg -l | grep -qi "^ii\s\+thehive\s\+5.2.16"; then
+    log_ok "TheHive 5.2.16 installed."
+  else
+    log_warn "TheHive installation might have issues; verify with: dpkg -l | grep thehive"
+  fi
 }
 
-configure_thehive() {
-    log_step "Configuring TheHive application (native mode)..."
+# ---------------------------------------------------------------------------
+# CORTEX INSTALL (NATIVE)
+# ---------------------------------------------------------------------------
+install_cortex() {
+  log_step "Installing Cortex 3.1.8..."
 
-    mkdir -p /etc/thehive
-    cat > /etc/thehive/secret.conf << 'EOF'
-# TheHive Secret Configuration
-# IMPORTANT:
-#   In production, you MUST change this to a long, random string.
-#   This key is used to sign session cookies and other secrets.
+  cd /tmp
+  local pkg="cortex_3.1.8-1_all.deb"
+  local url_default="https://cortex.download.strangebee.com/3.1/deb/${pkg}"
+  local url="${CORTEX_DEB_URL:-$url_default}"
+
+  if [[ -f "/tmp/${pkg}" ]]; then
+    log_info "Using local Cortex package: /tmp/${pkg}"
+  else
+    log_info "Downloading Cortex from: ${url}"
+    if ! wget -q "${url}" -O "${pkg}"; then
+      log_error "Failed to download Cortex package from ${url}."
+      exit 1
+    fi
+  fi
+
+  dpkg -i "${pkg}" || true
+  apt-get install -f -y || true
+
+  if dpkg -l | grep -qi "^ii\s\+cortex\s\+3.1.8"; then
+    log_ok "Cortex 3.1.8 installed."
+  else
+    log_warn "Cortex installation might have issues; verify with: dpkg -l | grep cortex"
+  fi
+
+  mkdir -p /opt/cortex/data /var/log/cortex
+  chown -R cortex:cortex /opt/cortex /var/log/cortex || true
+}
+
+# ---------------------------------------------------------------------------
+# THEHIVE CONFIG (NATIVE)
+# ---------------------------------------------------------------------------
+configure_thehive() {
+  log_step "Configuring TheHive (native)..."
+
+  mkdir -p /etc/thehive
+
+  cat > /etc/thehive/secret.conf << 'EOF'
+# IMPORTANT: Change this in production.
 play.http.secret.key="changeme_in_production_make_this_very_long_and_secure_12345"
 EOF
 
-    cat > /etc/thehive/application.conf << 'EOF'
-# ============================================================================ #
-# TheHive Enterprise Configuration
-# Version: 5.2.16
-# Description: Production-style configuration for TheHive on a single node
-# ============================================================================ #
-
+  cat > /etc/thehive/application.conf << 'EOF'
 include "/etc/thehive/secret.conf"
 
 db.janusgraph {
   storage {
     backend = cql
     hostname = ["127.0.0.1"]
-
     cql {
       cluster-name = "TheHive Cluster"
       keyspace = "thehive"
-
       connection-pool {
         max-requests-per-connection = 1024
         local {
@@ -627,7 +607,6 @@ db.janusgraph {
     backend = elasticsearch
     hostname = ["127.0.0.1"]
     index-name = "thehive"
-
     elasticsearch {
       client.sniff = false
     }
@@ -659,10 +638,7 @@ cortex {
       name = "local-cortex"
       url = "http://127.0.0.1:9001"
 
-      # auth {
-      #   type = "bearer"
-      #   key  = "YOUR_CORTEX_API_KEY"
-      # }
+      # auth block will be added later using Cortex API key
 
       wsConfig {
         timeout.connection = 1 minute
@@ -692,7 +668,7 @@ play.filters.cors {
 }
 
 play.filters.hosts {
-  allowed = ["."] 
+  allowed = ["."]
 }
 
 play.server.akka {
@@ -700,66 +676,25 @@ play.server.akka {
   request-timeout = 60s
 }
 
-application.global = org.thp.thehive.controllers.TheHive
 application.langs = "en"
 EOF
 
-    mkdir -p /opt/thp/thehive/{database,index,files,thumbnails} /var/log/thehive
-    chown -R thehive:thehive /opt/thp/thehive /var/log/thehive || true
+  mkdir -p /opt/thp/thehive/{database,index,files,thumbnails} /var/log/thehive
+  chown -R thehive:thehive /opt/thp/thehive /var/log/thehive || true
 
-    log_ok "TheHive configuration written (native mode)."
+  log_ok "TheHive configuration written."
 }
 
 # ---------------------------------------------------------------------------
-# CORTEX INSTALL + CONFIG (NATIVE MODE)
+# CORTEX CONFIG (NATIVE)
 # ---------------------------------------------------------------------------
-install_cortex() {
-    log_step "Installing Cortex 3.1.8..."
-
-    cd /tmp
-
-    local cortex_deb="cortex_3.1.8-1_all.deb"
-    local cortex_url_default="https://cortex.download.strangebee.com/3.1/deb/${cortex_deb}"
-    local cortex_url="${CORTEX_DEB_URL:-$cortex_url_default}"
-
-    if [[ -f "/tmp/${cortex_deb}" ]]; then
-        log_info "Using existing local Cortex package: /tmp/${cortex_deb}"
-    else
-        log_info "Downloading Cortex package from: ${cortex_url}"
-        if ! wget -q "${cortex_url}" -O "${cortex_deb}"; then
-            log_error "Failed to download Cortex package from ${cortex_url}."
-            log_error "You can place ${cortex_deb} in /tmp or set CORTEX_DEB_URL to your own mirror."
-            exit 1
-        fi
-    fi
-
-    dpkg -i "${cortex_deb}" || true
-    apt-get install -f -y
-
-    if dpkg -l | grep -qi "^ii\s\+cortex\s\+3.1.8"; then
-        log_ok "Cortex 3.1.8 package installed."
-    else
-        log_warn "Cortex 3.1.8 package installation may have issues – verify with: dpkg -l | grep cortex"
-    fi
-
-    mkdir -p /opt/cortex/data /var/log/cortex
-    chown -R cortex:cortex /opt/cortex /var/log/cortex || true
-    log_ok "Cortex directories /opt/cortex and /var/log/cortex prepared."
-}
-
 configure_cortex() {
-    log_step "Configuring Cortex application (native mode)..."
+  log_step "Configuring Cortex (native)..."
 
-    mkdir -p /etc/cortex
+  mkdir -p /etc/cortex
 
-    cat > /etc/cortex/application.conf << 'EOF'
-# ============================================================================ #
-# Cortex Enterprise Configuration
-# Version: 3.1.8
-# Description: Production-style configuration for Cortex
-# ============================================================================ #
-
-play.http.secret.key = "cortex_production_secret_change_this_make_it_long_and_secure_67890"
+  cat > /etc/cortex/application.conf << 'EOF'
+play.http.secret.key = "cortex_production_secret_change_this_make_it_long-and-secure_67890"
 
 search {
   host = ["127.0.0.1:9200"]
@@ -792,24 +727,20 @@ auth.verification {
 
 analyzer {
   urls = [
-    "/opt/Cortex-Analyzers/analyzers"
+    "https://download.thehive-project.org/analyzers.json"
   ]
-
   fork-join-executor {
     parallelism-min = 4
     parallelism-factor = 2.0
     parallelism-max = 16
   }
-
-  configs = [
-  ]
+  configs = [ ]
 }
 
 responder {
   urls = [
-    "/opt/Cortex-Analyzers/responders"
+    "https://download.thehive-project.org/responders.json"
   ]
-
   fork-join-executor {
     parallelism-min = 2
     parallelism-factor = 1.0
@@ -845,9 +776,6 @@ logger.cortex = INFO
 logger.org.elasticsearch = WARN
 logger.com.sksamuel.elastic4s = WARN
 
-play.modules.enabled += "play.api.libs.ws.ahc.AhcWSModule"
-play.modules.enabled += "play.api.cache.ehcache.EhCacheModule"
-
 cortex.jobs {
   clean-status-timeout = 1 hour
   clean-action-timeout = 7 days
@@ -858,80 +786,47 @@ docker {
 }
 EOF
 
-    cat > /etc/cortex/logback.xml << 'EOF'
+  cat > /etc/cortex/logback.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>/var/log/cortex/application.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+      <fileNamePattern>/var/log/cortex/application.%d{yyyy-MM-dd}.log</fileNamePattern>
+      <maxHistory>30</maxHistory>
+      <totalSizeCap>3GB</totalSizeCap>
+    </rollingPolicy>
+    <encoder>
+      <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
+    </encoder>
+  </appender>
 
-    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>/var/log/cortex/application.log</file>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <fileNamePattern>/var/log/cortex/application.%d{yyyy-MM-dd}.log</fileNamePattern>
-            <maxHistory>30</maxHistory>
-            <totalSizeCap>3GB</totalSizeCap>
-        </rollingPolicy>
-        <encoder>
-            <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
-        </encoder>
-    </appender>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
+    </encoder>
+  </appender>
 
-    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%date [%level] from %logger in %thread - %message%n%xException</pattern>
-        </encoder>
-    </appender>
-
-    <logger name="play" level="INFO"/>
-    <logger name="application" level="INFO"/>
-    <logger name="analyzer" level="INFO"/>
-    <logger name="responder" level="INFO"/>
-
-    <root level="INFO">
-        <appender-ref ref="FILE"/>
-        <appender-ref ref="STDOUT"/>
-    </root>
-
+  <root level="INFO">
+    <appender-ref ref="FILE"/>
+    <appender-ref ref="STDOUT"/>
+  </root>
 </configuration>
 EOF
 
-    mkdir -p /var/log/cortex
-    chown -R cortex:cortex /var/log/cortex || true
+  mkdir -p /var/log/cortex
+  chown -R cortex:cortex /var/log/cortex || true
 
-    log_ok "Cortex configuration written (native mode)."
+  log_ok "Cortex configuration written."
 }
 
 # ---------------------------------------------------------------------------
-# CORTEX ANALYZERS REPO (NATIVE MODE)
-# ---------------------------------------------------------------------------
-install_cortex_analyzers_repo() {
-    log_step "Preparing Cortex-Analyzers repository under /opt..."
-
-    if [[ -d /opt/Cortex-Analyzers/.git ]]; then
-        log_info "Cortex-Analyzers git repository already present. Updating..."
-        (
-          cd /opt/Cortex-Analyzers && \
-          git pull --rebase --stat >/dev/null 2>&1
-        ) || log_warn "Failed to update Cortex-Analyzers repository. Using existing copy."
-    elif [[ -d /opt/Cortex-Analyzers ]]; then
-        log_warn "Directory /opt/Cortex-Analyzers exists but is not a git repository. Leaving as-is."
-    else
-        log_info "Cloning Cortex-Analyzers into /opt/Cortex-Analyzers..."
-        if ! git clone https://github.com/TheHive-Project/Cortex-Analyzers.git /opt/Cortex-Analyzers >/dev/null 2>&1; then
-            log_warn "Failed to clone Cortex-Analyzers from GitHub. Analyzers will not be available unless you provide them manually in /opt/Cortex-Analyzers."
-            return 0
-        fi
-    fi
-
-    chown -R cortex:cortex /opt/Cortex-Analyzers 2>/dev/null || log_warn "Could not chown /opt/Cortex-Analyzers to cortex:cortex. Check permissions manually."
-    log_ok "Cortex-Analyzers directory prepared at /opt/Cortex-Analyzers"
-}
-
-# ---------------------------------------------------------------------------
-# SYSTEMD SERVICES (NATIVE MODE)
+# SYSTEMD SERVICES (NATIVE)
 # ---------------------------------------------------------------------------
 setup_systemd_services() {
-    log_step "Configuring systemd services for TheHive and Cortex..."
+  log_step "Configuring systemd services for TheHive / Cortex..."
 
-    cat > /etc/systemd/system/thehive.service << 'EOF'
+  cat > /etc/systemd/system/thehive.service << 'EOF'
 [Unit]
 Description=TheHive 5.2.16
 Documentation=https://thehive-project.org
@@ -944,7 +839,7 @@ User=thehive
 Group=thehive
 WorkingDirectory=/opt/thehive
 
-Environment="JAVA_OPTS=-Xms1g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+Environment="JAVA_OPTS=-Xms512m -Xmx1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
 Environment="CONFIG_FILE=/etc/thehive/application.conf"
 
 LimitNOFILE=65536
@@ -969,12 +864,12 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 EOF
 
-    cat > /etc/systemd/system/cortex.service << 'EOF'
+  cat > /etc/systemd/system/cortex.service << 'EOF'
 [Unit]
 Description=Cortex 3.1.8 - Observable Analysis Engine
 Documentation=https://docs.thehive-project.org/cortex/
 After=network.target elasticsearch.service
-Wants=network.target elasticsearch.service
+Wants=elasticsearch.service
 Requires=elasticsearch.service
 
 [Service]
@@ -983,14 +878,14 @@ User=cortex
 Group=cortex
 WorkingDirectory=/opt/cortex
 
-Environment="JAVA_OPTS=-Xms512m -Xmx1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Djava.awt.headless=true"
+Environment="JAVA_OPTS=-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Djava.awt.headless=true"
 Environment="CONFIG_FILE=/etc/cortex/application.conf"
 
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/cortex/data /var/log/cortex /opt/Cortex-Analyzers
+ReadWritePaths=/opt/cortex/data /var/log/cortex
 
 LimitNOFILE=65536
 LimitNPROC=4096
@@ -1018,283 +913,98 @@ SuccessExitStatus=143
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    log_ok "Systemd units created and daemon reloaded."
+  systemctl daemon-reload || true
+  log_ok "systemd units created and daemon reloaded."
+}
+
+start_services_native() {
+  log_step "Starting native services (Elasticsearch, Cassandra, Cortex, TheHive)..."
+
+  systemctl restart elasticsearch || true
+  sleep 10
+
+  systemctl restart cassandra || true
+  sleep 20
+
+  systemctl enable cortex thehive || true
+  systemctl restart cortex || true
+  sleep 10
+
+  systemctl restart thehive || true
+
+  log_ok "Start commands issued for native services."
+}
+
+wait_for_services_native() {
+  log_step "Checking services health (native)..."
+
+  log_info "Checking Elasticsearch..."
+  curl -s http://127.0.0.1:9200 >/dev/null 2>&1 \
+    && log_ok "Elasticsearch API reachable." \
+    || log_warn "Elasticsearch API not reachable (yet)."
+
+  log_info "Checking Cassandra via cqlsh..."
+  cqlsh -e "DESCRIBE KEYSPACES" >/dev/null 2>&1 \
+    && log_ok "Cassandra responds to cqlsh." \
+    || log_warn "Cassandra cqlsh check failed."
+
+  log_info "Checking Cortex..."
+  curl -s http://127.0.0.1:9001/api/status >/dev/null 2>&1 \
+    && log_ok "Cortex API reachable." \
+    || log_warn "Cortex API not reachable."
+
+  log_info "Checking TheHive..."
+  curl -s http://127.0.0.1:9000/api/status >/dev/null 2>&1 \
+    && log_ok "TheHive API reachable." \
+    || log_warn "TheHive API not reachable (may be still starting)."
 }
 
 # ---------------------------------------------------------------------------
-# START & HEALTH CHECK (NATIVE MODE)
+# DOCKER MODE HELPERS
 # ---------------------------------------------------------------------------
-start_services() {
-    log_step "Starting all services (native mode)..."
+ensure_docker_and_compose() {
+  log_step "Installing Docker engine and compose (Docker mode)..."
 
-    log_info "Starting Elasticsearch..."
-    systemctl restart elasticsearch || {
-        log_error "Failed to start Elasticsearch."
-        exit 1
+  if ! command -v docker >/dev/null 2>&1; then
+    log_info "Docker not found, installing docker.io..."
+    apt-get update || true
+    apt-get install -y docker.io || {
+      log_error "Failed to install docker.io."
+      exit 1
     }
-    sleep 10
-
-    log_info "Starting Cassandra..."
-    systemctl restart cassandra || {
-        log_error "Failed to start Cassandra."
-        exit 1
-    }
-    sleep 15
-
-    log_info "Starting Cortex..."
-    systemctl enable cortex || true
-    systemctl restart cortex || {
-        log_error "Failed to start Cortex. Check: journalctl -u cortex -n 50 --no-pager"
-        exit 1
-    }
-    sleep 10
-
-    log_info "Starting TheHive..."
-    systemctl enable thehive || true
-    systemctl restart thehive || {
-        log_error "Failed to start TheHive. Check: journalctl -u thehive -n 50 --no-pager"
-        exit 1
-    }
-
-    log_ok "Start commands issued for all services (native mode)."
-}
-
-wait_for_services() {
-    log_step "Checking services health (native mode)..."
-
-    log_info "Checking Elasticsearch..."
-    if curl -s http://127.0.0.1:9200 >/dev/null 2>&1; then
-        log_ok "Elasticsearch HTTP is reachable."
-    else
-        log_warn "Elasticsearch HTTP is NOT reachable. Check: journalctl -u elasticsearch -n 50 --no-pager"
-    fi
-
-    log_info "Checking Cassandra via cqlsh..."
-    if cqlsh -e "DESCRIBE KEYSPACES" >/dev/null 2>&1; then
-        log_ok "Cassandra responds to cqlsh."
-    else
-        log_warn "Cassandra cqlsh check failed. Check: journalctl -u cassandra -n 50 --no-pager and /var/log/cassandra/*.log"
-    fi
-
-    log_info "Checking Cortex API..."
-    if curl -s http://127.0.0.1:9001/api/status >/dev/null 2>&1; then
-        log_ok "Cortex API is reachable."
-    else
-        log_warn "Cortex API not reachable at /api/status. Check: journalctl -u cortex -n 50 --no-pager"
-    fi
-
-    log_info "Checking TheHive API..."
-    if curl -s http://127.0.0.1:9000/api/status >/dev/null 2>&1; then
-        log_ok "TheHive API is reachable."
-    else
-        log_warn "TheHive API not reachable at /api/status yet. TheHive may still be initializing data."
-        log_warn "If it stays like this, check: journalctl -u thehive -n 50 --no-pager"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# HEALTH CHECK HELPER (BOTH NATIVE + DOCKER)
-# ---------------------------------------------------------------------------
-create_health_check() {
-    log_step "Creating health check helper script..."
-
-    cat > /usr/local/bin/check-thehive-status << 'EOF'
-#!/bin/bash
-# Unified health check for:
-#  - Native services (systemd)
-#  - Docker stack (thehive-docker)
-
-echo "=== TheHive & Cortex Health Check ==="
-echo "Timestamp: $(date)"
-echo ""
-
-# Detect host IP (best-effort)
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-
-echo "Deployment overview:"
-echo "--------------------"
-echo "  Host IP              : ${HOST_IP:-unknown}"
-echo "  Native URLs (if used):"
-echo "    TheHive  : http://127.0.0.1:9000"
-echo "    Cortex   : http://127.0.0.1:9001"
-echo "    ES       : http://127.0.0.1:9200"
-echo "  Docker URLs (if used):"
-echo "    TheHive  : http://${HOST_IP:-localhost}:19000"
-echo "    Cortex   : http://${HOST_IP:-localhost}:19001"
-echo "    ES       : http://${HOST_IP:-localhost}:19200"
-echo ""
-
-echo "=== NATIVE SERVICES (systemd) ==="
-echo "Service Status:"
-echo "---------------"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl is-active thehive >/dev/null 2>&1 && echo "✅ thehive.service: Running" || echo "❌ thehive.service: Not running"
-  systemctl is-active cortex  >/dev/null 2>&1 && echo "✅ cortex.service : Running" || echo "❌ cortex.service : Not running"
-  systemctl is-active elasticsearch >/dev/null 2>&1 && echo "✅ elasticsearch : Running" || echo "❌ elasticsearch : Not running"
-  systemctl is-active cassandra    >/dev/null 2>&1 && echo "✅ cassandra     : Running" || echo "❌ cassandra     : Not running"
-else
-  echo "systemctl not available on this system."
-fi
-
-echo ""
-echo "Native API Status:"
-echo "------------------"
-curl -s http://127.0.0.1:9000/api/status  >/dev/null 2>&1 && echo "✅ TheHive (native) API: Accessible"   || echo "❌ TheHive (native) API: Not accessible"
-curl -s http://127.0.0.1:9001/api/status  >/dev/null 2>&1 && echo "✅ Cortex  (native) API: Accessible"   || echo "❌ Cortex  (native) API: Not accessible"
-curl -s http://127.0.0.1:9200             >/dev/null 2>&1 && echo "✅ ES      (native) API: Accessible"   || echo "❌ ES      (native) API: Not accessible"
-
-echo ""
-echo "=== DOCKER STACK (thehive-docker) ==="
-if command -v docker >/dev/null 2>&1; then
-  echo "Docker containers:"
-  echo "------------------"
-  # Try docker compose ps (plugin) first, fall back to docker-compose, then docker ps
-  if docker compose ps >/dev/null 2>&1; then
-    docker compose ps
-  elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose ps
   else
-    docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' | grep -E 'thehive|cortex|cassandra|elastic' || echo "No relevant containers running."
+    log_info "Docker already installed."
   fi
 
-  echo ""
-  echo "Docker API Status:"
-  echo "------------------"
-  curl -s "http://${HOST_IP:-localhost}:19000/api/status" >/dev/null 2>&1 && echo "✅ TheHive (docker) API: Accessible" || echo "❌ TheHive (docker) API: Not accessible"
-  curl -s "http://${HOST_IP:-localhost}:19001/api/status" >/dev/null 2>&1 && echo "✅ Cortex  (docker) API: Accessible" || echo "❌ Cortex  (docker) API: Not accessible"
-  curl -s "http://${HOST_IP:-localhost}:19200"            >/dev/null 2>&1 && echo "✅ ES      (docker) API: Accessible" || echo "❌ ES      (docker) API: Not accessible"
-else
-  echo "Docker is not installed on this host."
-fi
-
-echo ""
-echo "Disk Space (/, /opt, /var/lib, /var/lib/docker if present):"
-echo "-----------------------------------------------------------"
-df -h / /opt /var/lib /var/lib/docker 2>/dev/null | grep -v tmpfs
-
-echo ""
-echo "Recent native errors from TheHive and Cortex (last 10 lines each):"
-echo "------------------------------------------------------------------"
-if command -v journalctl >/dev/null 2>&1; then
-  journalctl -u thehive --since "1 hour ago" | grep -i error | tail -10 || echo "No recent TheHive native errors."
-  journalctl -u cortex  --since "1 hour ago" | grep -i error | tail -10 || echo "No recent Cortex  native errors."
-else
-  echo "journalctl not available; skipping systemd logs."
-fi
-
-echo ""
-echo "Tip:"
-echo "  - If you're using Docker only, focus on the Docker API status and 'docker compose ps'."
-echo "  - If you're using native services only, focus on systemd service status and native APIs."
-EOF
-
-    chmod +x /usr/local/bin/check-thehive-status
-    log_ok "Health check script created at /usr/local/bin/check-thehive-status"
-}
-
-# ---------------------------------------------------------------------------
-# FINAL SUMMARY (NATIVE MODE)
-# ---------------------------------------------------------------------------
-finalize_installation_native() {
-    log_step "Writing installation summary (native mode)..."
-
-    cat > /root/thehive-installation-summary.txt << EOF
-=== THEHIVE & CORTEX INSTALLATION SUMMARY (NATIVE MODE) ===
-
-Installation Date: $(date)
-TheHive Version: 5.2.16
-Cortex Version: 3.1.8
-Elasticsearch: 7.17.29 (single-node)
-Cassandra: 3.11/4.x (single-node config, auth = AllowAllAuthenticator)
-
-ACCESS INFORMATION
-------------------
-TheHive URL : http://$(hostname -I | awk '{print $1}'):9000
-Default user: admin@thehive.local / secret
-
-Cortex URL  : http://$(hostname -I | awk '{print $1}'):9001
-Default user: admin / admin
-
-IMPORTANT FILES
----------------
-TheHive config : /etc/thehive/application.conf
-TheHive secret : /etc/thehive/secret.conf
-Cortex config  : /etc/cortex/application.conf
-Cortex logback : /etc/cortex/logback.xml
-TheHive unit   : /etc/systemd/system/thehive.service
-Cortex unit    : /etc/systemd/system/cortex.service
-
-HELPER SCRIPTS
---------------
-Health check       : /usr/local/bin/check-thehive-status
-
-EOF
-
-    log_ok "Installation summary written to /root/thehive-installation-summary.txt"
-    echo ""
-    cat /root/thehive-installation-summary.txt
-}
-
-# ---------------------------------------------------------------------------
-# DOCKER MODE: ENGINE + COMPOSE + STACK
-# ---------------------------------------------------------------------------
-docker_run_compose() {
+  if command -v docker-compose >/dev/null 2>&1; then
+    log_info "'docker-compose' binary is available."
+    DOCKER_COMPOSE_CMD="docker-compose"
+  else
+    # Try docker compose plugin
     if docker compose version >/dev/null 2>&1; then
-        docker compose "$@"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        docker-compose "$@"
+      log_info "'docker compose' plugin is available."
+      DOCKER_COMPOSE_CMD="docker compose"
     else
-        log_error "Neither 'docker compose' nor 'docker-compose' is available."
-        log_error "Docker compose plugin installation failed. Check manually."
+      log_info "Installing docker-compose..."
+      apt-get install -y docker-compose || {
+        log_error "Failed to install docker-compose."
         exit 1
+      }
+      DOCKER_COMPOSE_CMD="docker-compose"
     fi
+  fi
 }
 
-docker_install_engine_and_compose() {
-    log_step "Installing Docker engine and compose (Docker mode)..."
+write_docker_compose() {
+  log_info "Writing docker-compose.yml to /opt/thehive-docker"
+  mkdir -p /opt/thehive-docker
 
-    if ! command -v docker >/dev/null 2>&1; then
-        log_info "Docker not found, installing docker.io..."
-        apt-get update || true
-        apt-get install -y docker.io
-        systemctl enable docker || true
-        systemctl start docker || true
-    else
-        log_info "Docker already installed."
-    fi
-
-    if docker compose version >/dev/null 2>&1; then
-        log_info "'docker compose' subcommand is available."
-    elif command -v docker-compose >/dev/null 2>&1; then
-        log_info "'docker-compose' binary is available."
-    else
-        log_info "No compose tool found. Installing docker-compose-plugin and docker-compose..."
-        apt-get update || true
-        apt-get install -y docker-compose-plugin docker-compose || apt-get install -y docker-compose || true
-
-        if docker compose version >/dev/null 2>&1; then
-            log_ok "docker compose plugin installed successfully."
-        elif command -v docker-compose >/dev/null 2>&1; then
-            log_ok "docker-compose binary installed successfully."
-        else
-            log_error "Failed to install any compose tool (docker compose / docker-compose)."
-            log_error "Please install it manually and re-run in Docker mode."
-            exit 1
-        fi
-    fi
-}
-
-docker_write_compose_file() {
-    log_info "Writing docker-compose.yml to /opt/thehive-docker"
-
-    mkdir -p /opt/thehive-docker
-    cat > /opt/thehive-docker/docker-compose.yml << EOF
+  cat > /opt/thehive-docker/docker-compose.yml << 'EOF'
 version: "3.8"
 
 services:
   elasticsearch:
-    image: "${ES_DOCKER_IMAGE_DEFAULT}"
+    image: "elasticsearch:7.17.9"
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -1360,133 +1070,236 @@ volumes:
 EOF
 }
 
-docker_deploy_stack() {
-    log_info "Deploying Docker stack..."
+deploy_docker_stack() {
+  log_step "Deploying Docker stack..."
 
-    cd /opt/thehive-docker
+  cd /opt/thehive-docker
 
-    log_info "Pulling Docker images..."
-    docker_run_compose pull || log_warn "compose pull failed; continuing with local images if any."
+  log_info "Pulling Docker images..."
+  if ! ${DOCKER_COMPOSE_CMD} pull; then
+    log_warn "compose pull failed; continuing with local images if any."
+  fi
 
-    log_info "Starting Docker stack..."
-    docker_run_compose up -d
-
-    log_info "Waiting for services to come up (Docker mode)..."
-    sleep 20
-
-    local host_ip
-    host_ip=$(hostname -I | awk '{print $1}')
-
-    log_info "Checking TheHive (Docker) at http://${host_ip}:19000/api/status ..."
-    if curl -s "http://${host_ip}:19000/api/status" >/dev/null 2>&1; then
-        log_ok "TheHive (Docker) API is reachable."
-    else
-        log_warn "TheHive (Docker) API not reachable yet."
-    fi
-
-    log_info "Checking Cortex (Docker) at http://${host_ip}:19001/api/status ..."
-    if curl -s "http://${host_ip}:19001/api/status" >/dev/null 2>&1; then
-        log_ok "Cortex (Docker) API is reachable."
-    else
-        log_warn "Cortex (Docker) API not reachable yet."
-    fi
-
-    log_info "Checking Elasticsearch (Docker) at http://${host_ip}:19200 ..."
-    if curl -s "http://${host_ip}:19200" >/dev/null 2>&1; then
-        log_ok "Elasticsearch (Docker) is reachable."
-    else
-        log_warn "Elasticsearch (Docker) not reachable yet."
-    fi
+  log_info "Starting Docker stack..."
+  if ! ${DOCKER_COMPOSE_CMD} up -d; then
+    log_error "Failed to start docker-compose stack."
+    exit 1
+  fi
 }
 
-docker_final_summary() {
-    local host_ip
-    host_ip=$(hostname -I | awk '{print $1}')
+wait_for_services_docker() {
+  log_step "Waiting for services to come up (Docker mode)..."
 
-    echo ""
-    echo "=== THEHIVE & CORTEX DOCKER STACK DEPLOYED ==="
-    echo ""
-    echo "Access URLs (Docker mode):"
-    echo "  TheHive : http://${host_ip}:19000"
-    echo "    Default user: admin@thehive.local / secret"
-    echo ""
-    echo "  Cortex  : http://${host_ip}:19001"
-    echo "    Default user: admin / admin"
-    echo ""
-    echo "Services data stored in Docker volumes:"
-    echo "  - esdata_lab"
-    echo "  - cassdata_lab"
-    echo "  - cortex-jobs_lab"
-    echo "  - cortex-logs_lab"
-    echo "  - thehive-data_lab"
-    echo ""
-    echo "To manage the stack:"
-    echo "  cd /opt/thehive-docker"
-    echo "  docker compose ps           # or: docker-compose ps"
-    echo "  docker compose logs thehive # see logs"
-    echo "  docker compose down         # stop and remove containers"
-    echo ""
-    echo "Health check:"
-    echo "  check-thehive-status"
-    echo ""
+  local host_ip
+  host_ip=$(hostname -I | awk '{print $1}')
+
+  log_info "Checking TheHive (Docker) at http://${host_ip}:19000/api/status ..."
+  curl -s "http://${host_ip}:19000/api/status" >/dev/null 2>&1 \
+    && log_ok "TheHive (Docker) reachable." \
+    || log_warn "TheHive (Docker) API not reachable yet."
+
+  log_info "Checking Cortex (Docker) at http://${host_ip}:19001/api/status ..."
+  curl -s "http://${host_ip}:19001/api/status" >/dev/null 2>&1 \
+    && log_ok "Cortex (Docker) reachable." \
+    || log_warn "Cortex (Docker) API not reachable yet."
+
+  log_info "Checking Elasticsearch (Docker) at http://${host_ip}:19200 ..."
+  curl -s "http://${host_ip}:19200" >/dev/null 2>&1 \
+    && log_ok "Elasticsearch (Docker) reachable." \
+    || log_warn "Elasticsearch (Docker) not reachable yet."
+
+  echo ""
+  echo "=== THEHIVE & CORTEX DOCKER STACK DEPLOYED ==="
+  echo ""
+  echo "Access URLs (Docker mode):"
+  echo "  TheHive : http://${host_ip}:19000"
+  echo "    Default user: admin@thehive.local / secret"
+  echo ""
+  echo "  Cortex  : http://${host_ip}:19001"
+  echo "    Default user: admin / admin"
+  echo ""
+  echo "Services data stored in Docker volumes:"
+  echo "  - esdata_lab"
+  echo "  - cassdata_lab"
+  echo "  - cortex-jobs_lab"
+  echo "  - cortex-logs_lab"
+  echo "  - thehive-data_lab"
+  echo ""
+  echo "To manage the stack:"
+  echo "  cd /opt/thehive-docker"
+  echo "  ${DOCKER_COMPOSE_CMD} ps           # show status"
+  echo "  ${DOCKER_COMPOSE_CMD} logs thehive # see logs"
+  echo "  ${DOCKER_COMPOSE_CMD} down         # stop and remove containers"
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# HEALTH CHECK SCRIPT (COMMON)
+# ---------------------------------------------------------------------------
+create_health_check_script() {
+  log_step "Creating health check helper script..."
+
+  cat > /usr/local/bin/check-thehive-status << 'EOF'
+#!/bin/bash
+echo "=== TheHive & Cortex Health Check ==="
+echo "Timestamp: $(date)"
+echo ""
+
+echo "Service Status (native systemd):"
+echo "--------------------------------"
+systemctl is-active thehive >/dev/null 2>&1 && echo "✅ TheHive (native): Running" || echo "❌ TheHive (native): Not running"
+systemctl is-active cortex  >/dev/null 2>&1 && echo "✅ Cortex (native): Running"  || echo "❌ Cortex (native): Not running"
+systemctl is-active elasticsearch >/dev/null 2>&1 && echo "✅ Elasticsearch (native): Running" || echo "❌ Elasticsearch (native): Not running"
+systemctl is-active cassandra    >/dev/null 2>&1 && echo "✅ Cassandra (native): Running"    || echo "❌ Cassandra (native): Not running"
+
+echo ""
+echo "Docker stack (if present in /opt/thehive-docker):"
+echo "-------------------------------------------------"
+if [ -d /opt/thehive-docker ]; then
+  if command -v docker-compose >/dev/null 2>&1; then
+    (cd /opt/thehive-docker && docker-compose ps)
+  elif docker compose version >/dev/null 2>&1; then
+    (cd /opt/thehive-docker && docker compose ps)
+  else
+    echo "docker-compose not installed."
+  fi
+else
+  echo "No /opt/thehive-docker directory."
+fi
+
+echo ""
+echo "API Status (host):"
+echo "------------------"
+# Native ports
+curl -s http://127.0.0.1:9000/api/status >/dev/null 2>&1 && echo "✅ TheHive native:  http://127.0.0.1:9000/api/status" || echo "❌ TheHive native:  not reachable"
+curl -s http://127.0.0.1:9001/api/status >/dev/null 2>&1 && echo "✅ Cortex native:   http://127.0.0.1:9001/api/status" || echo "❌ Cortex native:   not reachable"
+curl -s http://127.0.0.1:9200            >/dev/null 2>&1 && echo "✅ ES native:       http://127.0.0.1:9200"            || echo "❌ ES native:       not reachable"
+
+# Docker published ports
+HOST_IP=$(hostname -I | awk '{print $1}')
+curl -s "http://${HOST_IP}:19000/api/status" >/dev/null 2>&1 && echo "✅ TheHive docker:  http://${HOST_IP}:19000/api/status" || echo "❌ TheHive docker:  not reachable"
+curl -s "http://${HOST_IP}:19001/api/status" >/dev/null 2>&1 && echo "✅ Cortex docker:   http://${HOST_IP}:19001/api/status" || echo "❌ Cortex docker:   not reachable"
+curl -s "http://${HOST_IP}:19200"            >/dev/null 2>&1 && echo "✅ ES docker:       http://${HOST_IP}:19200"            || echo "❌ ES docker:       not reachable"
+
+echo ""
+echo "Top processes by memory (java, cassandra, elasticsearch, thehive, cortex):"
+echo "-------------------------------------------------------------------------"
+ps aux --sort=-%mem | head -n 25 | awk 'NR==1 || /java|cassandra|elasticsearch|thehive|cortex/ {print $1, $2, $4, $11}'
+
+echo ""
+echo "Disk Space (/, /opt, /var/lib):"
+echo "-------------------------------"
+df -h / /opt /var/lib | grep -v tmpfs
+EOF
+
+  chmod +x /usr/local/bin/check-thehive-status
+  log_ok "Health check script created at /usr/local/bin/check-thehive-status"
+}
+
+# ---------------------------------------------------------------------------
+# FINAL SUMMARY
+# ---------------------------------------------------------------------------
+final_summary_native() {
+  local ip
+  ip=$(hostname -I | awk '{print $1}')
+
+  cat > /root/thehive-installation-summary.txt << EOF
+=== THEHIVE & CORTEX NATIVE INSTALLATION SUMMARY ===
+
+Installation Date: $(date)
+Mode: Native packages (.deb)
+
+Versions (expected):
+  TheHive:  5.2.16
+  Cortex:   3.1.8
+  Elastic:  7.17.29
+  Cassandra: single-node
+
+ACCESS
+------
+TheHive: http://${ip}:9000
+  Default user: admin@thehive.local / secret
+
+Cortex:  http://${ip}:9001
+  Default user: admin / admin
+
+KEY FILES
+---------
+TheHive config : /etc/thehive/application.conf
+TheHive secret : /etc/thehive/secret.conf
+Cortex config  : /etc/cortex/application.conf
+Cortex logback : /etc/cortex/logback.xml
+
+Systemd units  : /etc/systemd/system/thehive.service
+                 /etc/systemd/system/cortex.service
+
+Health check   : /usr/local/bin/check-thehive-status
+
+NEXT STEPS
+----------
+1. Change all default passwords in TheHive and Cortex.
+2. Run: check-thehive-status
+3. Integrate TheHive with Cortex by adding Cortex API key into:
+   /etc/thehive/application.conf (cortex.servers[0].auth)
+4. Optionally configure HTTPS reverse proxy (Nginx) in front of ports 9000/9001.
+EOF
+
+  log_ok "Installation summary written to /root/thehive-installation-summary.txt"
+  echo ""
+  cat /root/thehive-installation-summary.txt || true
+}
+
+final_summary_docker() {
+  log_ok "Docker deployment completed. Use 'check-thehive-status' for a quick check."
 }
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 main() {
-    print_banner
-    validate_root
-    validate_os
-    check_system_resources
-    choose_deployment_mode
-    ensure_no_package_manager_running
-    pre_cleanup
+  print_banner
+  validate_root
+  validate_os
+  check_system_resources
+  choose_deploy_mode
+  ensure_no_package_manager_running
+  pre_cleanup
+  create_health_check_script
 
-    if [[ "${DEPLOY_MODE}" == "native" ]]; then
-        log_step "Starting native deployment pipeline..."
-        prepare_base_dirs
-        install_dependencies
-        install_elasticsearch_if_missing
-        install_cassandra_if_missing
-        setup_elasticsearch
-        setup_cassandra
-        install_thehive
-        install_cortex
-        install_cortex_analyzers_repo
-        configure_thehive
-        configure_cortex
-        setup_systemd_services
-        start_services
-        wait_for_services
-        create_health_check
-        finalize_installation_native
+  if [[ "${DEPLOY_MODE}" == "native" ]]; then
+    log_step "Starting native deployment pipeline..."
+    prepare_base_dirs
+    install_dependencies
+    install_elasticsearch_if_missing
+    install_cassandra_if_missing
+    setup_elasticsearch
+    setup_cassandra
+    install_thehive
+    install_cortex
+    configure_thehive
+    configure_cortex
+    setup_systemd_services
+    start_services_native
+    wait_for_services_native
+    final_summary_native
+  else
+    log_step "Starting Docker-based deployment pipeline..."
+    install_dependencies
+    ensure_docker_and_compose
+    write_docker_compose
+    deploy_docker_stack
+    wait_for_services_docker
+    final_summary_docker
+  fi
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║                    NATIVE DEPLOYMENT COMPLETED                ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
-        echo ""
-        echo "Quick start:"
-        echo "  TheHive: http://$(hostname -I | awk '{print $1}'):9000"
-        echo "  Cortex : http://$(hostname -I | awk '{print $1}'):9001"
-        echo "  Health : check-thehive-status"
-        echo ""
-    else
-        log_step "Starting Docker-based deployment pipeline..."
-        install_dependencies
-        docker_install_engine_and_compose
-        docker_write_compose_file
-        docker_deploy_stack
-        create_health_check
-        docker_final_summary
-
-        echo ""
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║                    DOCKER DEPLOYMENT COMPLETED                ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
-        echo ""
-    fi
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║                    DEPLOYMENT COMPLETED                        ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Quick ops:"
+  echo "  check-thehive-status"
+  echo ""
 }
 
 main "$@"
