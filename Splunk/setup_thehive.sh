@@ -10,15 +10,29 @@
 #     2) Ask for TheHive org admin name (used in certificate subject).
 #     3) Generate a self-signed TLS certificate/key for Nginx if missing.
 #     4) Configure an Nginx reverse proxy for TheHive (HTTPS on port 443).
-#     5) Create an EMPTY thehive_cortex_instances.csv lookup file for TA-thehive-cortex.
-#     6) Restart Splunk.
+#     5) Ensure /etc/hosts contains an entry for the FQDN.
+#     6) Create a CLEAN thehive_cortex_instances.csv lookup file for TA-thehive-cortex
+#        (backing up any existing one).
+#     7) Extract the LIVE certificate from Nginx and append it to TA certifi/cacert.pem
+#        so that SSL verification works (no hostname/CN mismatch, no wrong cert).
+#     8) Fix ownership on TA app and restart Splunk.
 #
 # IMPORTANT:
 #   - You must install TheHive and Splunk (and TA-thehive-cortex) beforehand.
 #   - Run this script as root.
-#   - All TA instance/config fields will be created later via Splunk UI.
+#   - All TA instance/config fields (id, api_key, etc.) are still created via Splunk UI,
+#     but this script guarantees a clean lookup and working TLS trust.
 
 set -euo pipefail
+
+################################
+# Basic safety checks          #
+################################
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "ERROR: This script must be run as root." >&2
+  exit 1
+fi
 
 ################################
 # Ask for basic information    #
@@ -26,6 +40,12 @@ set -euo pipefail
 
 read -rp "Enter TheHive FQDN (default: thehive.example.com): " SERVER_NAME_INPUT
 SERVER_NAME="${SERVER_NAME_INPUT:-thehive.example.com}"
+
+# Reject obviously invalid FQDNs (like ones containing '@' or spaces).
+if [[ "${SERVER_NAME}" == *"@"* || "${SERVER_NAME}" == *" "* ]]; then
+  echo "ERROR: Invalid FQDN '${SERVER_NAME}'. Do NOT use '@' or spaces. Use something like 'thehive.example.com'." >&2
+  exit 1
+fi
 
 read -rp "Enter TheHive org admin name (default: orgadmin): " ORG_ADMIN_INPUT
 ORG_ADMIN="${ORG_ADMIN_INPUT:-orgadmin}"
@@ -37,11 +57,9 @@ echo "==> Using ORG_ADMIN=${ORG_ADMIN}"
 # NGINX / TheHive      #
 ########################
 
-# Paths to TLS certificate and key consumed by Nginx.
 CERT_PATH="/etc/ssl/certs/thehive.crt"
 KEY_PATH="/etc/ssl/private/thehive.key"
 
-# Where TheHive itself is listening (HTTP).
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT="9000"
 
@@ -55,19 +73,20 @@ NGINX_ENABLED_LINK="${NGINX_SITES_ENABLED}/${NGINX_SITE_NAME}.conf"
 # Splunk / TA config   #
 ########################
 
-# Splunk runtime paths and user.
 SPLUNK_USER="splunk"
 SPLUNK_GROUP="splunk"
 SPLUNK_HOME="/opt/splunk"
 
-# TA-thehive-cortex app paths.
 APP_NAME="TA-thehive-cortex"
 APP_DIR="${SPLUNK_HOME}/etc/apps/${APP_NAME}"
 LOOKUP_DIR="${APP_DIR}/lookups"
 LOOKUP_FILE="${LOOKUP_DIR}/thehive_cortex_instances.csv"
 
+# Path to certifi bundle used by the TA Python environment.
+CERTIFI_CACERT="${APP_DIR}/bin/ta_thehive_cortex/aob_py3/certifi/cacert.pem"
+
 #########################################
-# 0) Generate self-signed TLS cert/key  #
+# 0) Generate (or reuse) TLS cert/key   #
 #########################################
 
 echo "==> Checking TLS certificate/key for Nginx ..."
@@ -94,8 +113,21 @@ else
   echo "    ${KEY_PATH}"
 fi
 
+######################################
+# 1) Configure /etc/hosts for FQDN  #
+######################################
+
+echo "==> Ensuring /etc/hosts has an entry for ${SERVER_NAME} ..."
+
+if ! grep -qE "[[:space:]]${SERVER_NAME}([[:space:]]|\$)" /etc/hosts; then
+  echo "127.0.0.1   ${SERVER_NAME}" >> /etc/hosts
+  echo "==> Added '127.0.0.1 ${SERVER_NAME}' to /etc/hosts"
+else
+  echo "==> /etc/hosts already contains an entry for ${SERVER_NAME}"
+fi
+
 ##################################
-# 1) Configure Nginx for TheHive #
+# 2) Configure Nginx for TheHive #
 ##################################
 
 echo "==> Configuring Nginx reverse proxy for TheHive ..."
@@ -137,12 +169,12 @@ EOF
 fi
 
 #################################
-# 2) Configure Splunk TA lookup #
+# 3) Configure Splunk TA lookup #
 #################################
 
 echo "==> Configuring TA-thehive-cortex on Splunk ..."
 
-if [ ! -d "${APP_DIR}" ]; then
+if [[ ! -d "${APP_DIR}" ]]; then
   echo "ERROR: ${APP_DIR} does not exist."
   echo "Install ${APP_NAME} from Splunkbase first (Apps > Manage Apps)."
   exit 1
@@ -156,22 +188,69 @@ mkdir -p "${LOOKUP_DIR}"
 chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "${LOOKUP_DIR}"
 chmod 755 "${LOOKUP_DIR}"
 
-echo "==> Creating EMPTY instance lookup CSV (UI will populate fields): ${LOOKUP_FILE}"
-# Create or truncate to empty file; no header, no rows.
-: > "${LOOKUP_FILE}"
+# If an old lookup file exists, back it up and recreate a CLEAN header-only CSV.
+if [[ -f "${LOOKUP_FILE}" ]]; then
+  TS="$(date +%Y%m%d%H%M%S)"
+  echo "==> Backing up existing lookup file to ${LOOKUP_FILE}.${TS}.bak"
+  mv "${LOOKUP_FILE}" "${LOOKUP_FILE}.${TS}.bak"
+fi
+
+echo "==> Creating CLEAN instance lookup CSV with header only: ${LOOKUP_FILE}"
+cat > "${LOOKUP_FILE}" <<'EOF'
+"account_name","authentication_type","client_cert",comment,environment,host,id,organisation,port,"proxy_account","proxy_url",type,uri
+EOF
 
 chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "${LOOKUP_FILE}"
 chmod 644 "${LOOKUP_FILE}"
 
+##########################################################
+# 4) Sync TA certifi bundle with LIVE Nginx certificate  #
+##########################################################
+
+if [[ -f "${CERTIFI_CACERT}" ]]; then
+  echo "==> Updating TA certifi bundle with LIVE Nginx certificate ..."
+
+  TMP_LIVE_CERT="/tmp/thehive_live.crt.$$"
+
+  # Extract the live certificate served by Nginx for SERVER_NAME.
+  openssl s_client -connect "${SERVER_NAME}:443" -servername "${SERVER_NAME}" </dev/null 2>/dev/null \
+    | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' > "${TMP_LIVE_CERT}"
+
+  if [[ ! -s "${TMP_LIVE_CERT}" ]]; then
+    echo "ERROR: Failed to retrieve LIVE certificate from Nginx for ${SERVER_NAME}." >&2
+    rm -f "${TMP_LIVE_CERT}"
+    exit 1
+  fi
+
+  # Optional: show fingerprint for logging/debugging.
+  echo "==> LIVE certificate fingerprint (from Nginx):"
+  openssl x509 -in "${TMP_LIVE_CERT}" -noout -fingerprint -sha256
+
+  # Append LIVE cert to certifi bundle (no harm if duplicated).
+  cat "${TMP_LIVE_CERT}" >> "${CERTIFI_CACERT}"
+
+  rm -f "${TMP_LIVE_CERT}"
+
+  echo "==> LIVE certificate appended to:"
+  echo "    ${CERTIFI_CACERT}"
+else
+  echo "WARNING: TA certifi bundle not found at:"
+  echo "  ${CERTIFI_CACERT}"
+  echo "You may be using a different TA version/path; adjust the script accordingly."
+fi
+
 ########################################
-# 3) Restart Splunk                    #
+# 5) Restart Splunk                    #
 ########################################
 
 echo "==> Restarting Splunk ..."
 "${SPLUNK_HOME}/bin/splunk" restart
 
 echo "==> All done."
+echo
 echo "Post-checks:"
-echo "  1) curl -sk https://${SERVER_NAME}/api/v1/status"
+echo "  1) From this host: curl -v https://${SERVER_NAME}/api/v1/status"
 echo "  2) In Splunk UI: TA-thehive-cortex > Configuration > Add TheHive instance"
-echo "     (saving the instance will populate thehive_cortex_instances.csv)."
+echo "     (saving the instance will populate thehive_cortex_instances.csv with a clean row)."
+echo "  3) Then run your alert and check:"
+echo "     index=_internal sourcetype=modular_alerts:thehive_create_a_new_case"
